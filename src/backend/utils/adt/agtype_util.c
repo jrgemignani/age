@@ -1596,18 +1596,16 @@ void agtype_hash_scalar_value_extended(const agtype_value *scalar_val,
         break;
     case AGTV_VERTEX:
     {
-        graphid id;
-        agtype_value *id_agt = GET_AGTYPE_VALUE_OBJECT_VALUE(scalar_val, "id");
-        id = id_agt->val.int_value;
+        /* Use direct struct access for vertex id */
+        graphid id = scalar_val->val.vertex.id;
         tmp = DatumGetUInt64(DirectFunctionCall2(
             hashint8extended, Float8GetDatum(id), UInt64GetDatum(seed)));
         break;
     }
     case AGTV_EDGE:
     {
-        graphid id;
-        agtype_value *id_agt = GET_AGTYPE_VALUE_OBJECT_VALUE(scalar_val, "id");
-        id = id_agt->val.int_value;
+        /* Use direct struct access for edge id */
+        graphid id = scalar_val->val.edge.id;
         tmp = DatumGetUInt64(DirectFunctionCall2(
             hashint8extended, Float8GetDatum(id), UInt64GetDatum(seed)));
         break;
@@ -1703,11 +1701,13 @@ static bool equals_agtype_scalar_value(agtype_value *a, agtype_value *b)
             return a->val.float_value == b->val.float_value;
         case AGTV_VERTEX:
         {
-            graphid a_graphid, b_graphid;
-            a_graphid = a->val.object.pairs[0].value.val.int_value;
-            b_graphid = b->val.object.pairs[0].value.val.int_value;
-
-            return a_graphid == b_graphid;
+            /* Use direct struct access for vertex ID comparison */
+            return a->val.vertex.id == b->val.vertex.id;
+        }
+        case AGTV_EDGE:
+        {
+            /* Use direct struct access for edge ID comparison */
+            return a->val.edge.id == b->val.edge.id;
         }
 
         default:
@@ -1790,16 +1790,29 @@ int compare_agtype_scalar_values(agtype_value *a, agtype_value *b)
             return compare_two_floats_orderability(a->val.float_value,
                                                    b->val.float_value);
         case AGTV_VERTEX:
+        {
+            /* Use direct struct access for vertex comparison */
+            graphid a_graphid = a->val.vertex.id;
+            graphid b_graphid = b->val.vertex.id;
+
+            if (a_graphid == b_graphid)
+            {
+                return 0;
+            }
+            else if (a_graphid > b_graphid)
+            {
+                return 1;
+            }
+            else
+            {
+                return -1;
+            }
+        }
         case AGTV_EDGE:
         {
-            agtype_value *a_id, *b_id;
-            graphid a_graphid, b_graphid;
-
-            a_id = GET_AGTYPE_VALUE_OBJECT_VALUE(a, "id");
-            b_id = GET_AGTYPE_VALUE_OBJECT_VALUE(b, "id");
-
-            a_graphid = a_id->val.int_value;
-            b_graphid = b_id->val.int_value;
+            /* Use direct struct access for edge comparison */
+            graphid a_graphid = a->val.edge.id;
+            graphid b_graphid = b->val.edge.id;
 
             if (a_graphid == b_graphid)
             {
@@ -1997,19 +2010,29 @@ static void convert_agtype_value(StringInfo buffer, agtentry *header,
     if (!val)
         return;
 
-    /*
-     * An agtype_value passed as val should never have a type of AGTV_BINARY,
-     * and neither should any of its sub-components. Those values will be
-     * produced by convert_agtype_array and convert_agtype_object, the results
-     * of which will not be passed back to this function as an argument.
-     */
-
     if (IS_A_AGTYPE_SCALAR(val))
         convert_agtype_scalar(buffer, header, val);
     else if (val->type == AGTV_ARRAY)
         convert_agtype_array(buffer, header, val, level);
     else if (val->type == AGTV_OBJECT)
         convert_agtype_object(buffer, header, val, level);
+    else if (val->type == AGTV_BINARY)
+    {
+        /*
+         * AGTV_BINARY represents an already-serialized container (array or
+         * object). We can copy it directly to the output buffer.
+         */
+        int padlen;
+        int len = val->val.binary.len;
+
+        /* Align to 4-byte boundary */
+        padlen = pad_buffer_to_int(buffer);
+
+        /* Copy the serialized container data directly */
+        append_to_buffer(buffer, (char *)val->val.binary.data, len);
+
+        *header = AGTENTRY_IS_CONTAINER | (padlen + len);
+    }
     else
         ereport(ERROR,
                 (errmsg("unknown agtype type %d to convert", val->type)));
@@ -2477,8 +2500,6 @@ void pfree_agtype_value_content(agtype_value* value)
             break;
 
         case AGTV_OBJECT:
-        case AGTV_VERTEX:
-        case AGTV_EDGE:
             for (i = 0; i < value->val.object.num_pairs; i++)
             {
                 pfree_agtype_value_content(&value->val.object.pairs[i].key);
@@ -2487,8 +2508,35 @@ void pfree_agtype_value_content(agtype_value* value)
             pfree_if_not_null(value->val.object.pairs);
             break;
 
+        case AGTV_VERTEX:
+            /* Free the label string */
+            pfree_if_not_null(value->val.vertex.label);
+            /* Free the properties agtype_value and its contents */
+            if (value->val.vertex.properties != NULL)
+            {
+                pfree_agtype_value_content(value->val.vertex.properties);
+                pfree(value->val.vertex.properties);
+            }
+            break;
+
+        case AGTV_EDGE:
+            /* Free the label string */
+            pfree_if_not_null(value->val.edge.label);
+            /* Free the properties agtype_value and its contents */
+            if (value->val.edge.properties != NULL)
+            {
+                pfree_agtype_value_content(value->val.edge.properties);
+                pfree(value->val.edge.properties);
+            }
+            break;
+
         case AGTV_BINARY:
-            pfree_if_not_null(value->val.binary.data);
+            /*
+             * AGTV_BINARY data is typically a pointer into an existing
+             * agtype structure, not an independently allocated block.
+             * The containing agtype is freed through PostgreSQL's normal
+             * memory management, so we should NOT try to free binary.data.
+             */
             break;
 
         case AGTV_NULL:

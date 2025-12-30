@@ -327,6 +327,11 @@ enum agtype_value_type
  * deserialized representation, that can easily support using the "val"
  * union across underlying types during manipulation.  The agtype on-disk
  * representation has various alignment considerations.
+ *
+ * NOTE: For AGTV_VERTEX and AGTV_EDGE types, we use dedicated struct members
+ * (vertex and edge) that provide O(1) direct field access instead of the
+ * object member which requires O(n) key lookups. The on-disk format remains
+ * the same (object with id, label, properties keys) for backward compatibility.
  */
 struct agtype_value
 {
@@ -362,11 +367,98 @@ struct agtype_value
             int len;
             agtype_container *data;
         } binary; /* Array or object, in on-disk format */
+
+        /*
+         * Vertex type with direct field access - O(1) instead of O(n) lookup.
+         * Fields:
+         *   id         - the graphid of the vertex
+         *   label_id   - the label table oid (for future use/optimization)
+         *   label_len  - length of the label string
+         *   label      - the label string (not necessarily null-terminated)
+         *   properties - pointer to properties agtype_value (AGTV_OBJECT or AGTV_BINARY)
+         */
+        struct
+        {
+            graphid id;
+            Oid label_id;
+            int label_len;
+            char *label;
+            agtype_value *properties;
+        } vertex;
+
+        /*
+         * Edge type with direct field access - O(1) instead of O(n) lookup.
+         * Fields:
+         *   id         - the graphid of the edge
+         *   label_id   - the label table oid (for future use/optimization)
+         *   start_id   - the graphid of the start vertex
+         *   end_id     - the graphid of the end vertex
+         *   label_len  - length of the label string
+         *   label      - the label string (not necessarily null-terminated)
+         *   properties - pointer to properties agtype_value (AGTV_OBJECT or AGTV_BINARY)
+         */
+        struct
+        {
+            graphid id;
+            Oid label_id;
+            graphid start_id;
+            graphid end_id;
+            int label_len;
+            char *label;
+            agtype_value *properties;
+        } edge;
     } val;
 };
 
 #define IS_A_AGTYPE_SCALAR(agtype_val) \
     ((agtype_val)->type >= AGTV_NULL && (agtype_val)->type < AGTV_ARRAY)
+
+/*
+ * Direct accessor macros for AGTV_VERTEX fields.
+ * These provide O(1) access instead of O(n) key lookup.
+ */
+#define AGTV_IS_VERTEX(agtv) ((agtv)->type == AGTV_VERTEX)
+#define AGTV_GET_VERTEX_ID(agtv) ((agtv)->val.vertex.id)
+#define AGTV_GET_VERTEX_LABEL_ID(agtv) ((agtv)->val.vertex.label_id)
+#define AGTV_GET_VERTEX_LABEL(agtv) ((agtv)->val.vertex.label)
+#define AGTV_GET_VERTEX_LABEL_LEN(agtv) ((agtv)->val.vertex.label_len)
+#define AGTV_GET_VERTEX_PROPERTIES(agtv) ((agtv)->val.vertex.properties)
+
+/*
+ * Direct accessor macros for AGTV_EDGE fields.
+ * These provide O(1) access instead of O(n) key lookup.
+ */
+#define AGTV_IS_EDGE(agtv) ((agtv)->type == AGTV_EDGE)
+#define AGTV_GET_EDGE_ID(agtv) ((agtv)->val.edge.id)
+#define AGTV_GET_EDGE_LABEL_ID(agtv) ((agtv)->val.edge.label_id)
+#define AGTV_GET_EDGE_START_ID(agtv) ((agtv)->val.edge.start_id)
+#define AGTV_GET_EDGE_END_ID(agtv) ((agtv)->val.edge.end_id)
+#define AGTV_GET_EDGE_LABEL(agtv) ((agtv)->val.edge.label)
+#define AGTV_GET_EDGE_LABEL_LEN(agtv) ((agtv)->val.edge.label_len)
+#define AGTV_GET_EDGE_PROPERTIES(agtv) ((agtv)->val.edge.properties)
+
+/*
+ * Generic accessor macros that work for both vertex and edge.
+ * Use when the type is already known to be AGTV_VERTEX or AGTV_EDGE.
+ */
+#define AGTV_IS_VERTEX_OR_EDGE(agtv) \
+    ((agtv)->type == AGTV_VERTEX || (agtv)->type == AGTV_EDGE)
+
+/* Get entity id - works for both vertex and edge */
+#define AGTV_GET_ENTITY_ID(agtv) \
+    ((agtv)->type == AGTV_VERTEX ? (agtv)->val.vertex.id : (agtv)->val.edge.id)
+
+/* Get entity label - works for both vertex and edge */
+#define AGTV_GET_ENTITY_LABEL(agtv) \
+    ((agtv)->type == AGTV_VERTEX ? (agtv)->val.vertex.label : (agtv)->val.edge.label)
+
+/* Get entity label length - works for both vertex and edge */
+#define AGTV_GET_ENTITY_LABEL_LEN(agtv) \
+    ((agtv)->type == AGTV_VERTEX ? (agtv)->val.vertex.label_len : (agtv)->val.edge.label_len)
+
+/* Get entity properties - works for both vertex and edge */
+#define AGTV_GET_ENTITY_PROPERTIES(agtv) \
+    ((agtv)->type == AGTV_VERTEX ? (agtv)->val.vertex.properties : (agtv)->val.edge.properties)
 
 /*
  * Key/value pair within an Object.

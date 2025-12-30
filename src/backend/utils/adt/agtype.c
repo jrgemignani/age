@@ -566,38 +566,107 @@ static void agtype_typecast_object(agtype_in_state *state, char *annotation)
     /* check for a cast to a vertex */
     if (len == 6 && pg_strncasecmp(annotation, "vertex", len) == 0)
     {
+        agtype_value *id_val = NULL;
+        agtype_value *label_val = NULL;
+        agtype_value *props_val = NULL;
+        int i;
+
         /* verify that the structure conforms to a valid vertex */
-        if (is_object_vertex(agtv))
-        {
-            agtv->type = AGTV_VERTEX;
-            /* if it isn't the top, we need to adjust the copied value */
-            if (!top)
-                last_updated_value->type = AGTV_VERTEX;
-        }
-        else
+        if (!is_object_vertex(agtv))
         {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("object is not a vertex")));
         }
 
+        /* Extract id, label, properties from the object */
+        for (i = 0; i < agtv->val.object.num_pairs; i++)
+        {
+            agtype_pair *pair = &agtv->val.object.pairs[i];
+            char *key = pair->key.val.string.val;
+            int key_len = pair->key.val.string.len;
+
+            if (key_len == 2 && strncmp(key, "id", 2) == 0)
+                id_val = &pair->value;
+            else if (key_len == 5 && strncmp(key, "label", 5) == 0)
+                label_val = &pair->value;
+            else if (key_len == 10 && strncmp(key, "properties", 10) == 0)
+                props_val = &pair->value;
+        }
+
+        /* Convert to new struct format */
+        agtv->type = AGTV_VERTEX;
+        agtv->val.vertex.id = id_val->val.int_value;
+        agtv->val.vertex.label_id = InvalidOid;
+        agtv->val.vertex.label_len = label_val->val.string.len;
+        agtv->val.vertex.label = label_val->val.string.val;
+
+        /* Copy properties - allocate a new agtype_value */
+        agtv->val.vertex.properties = palloc(sizeof(agtype_value));
+        memcpy(agtv->val.vertex.properties, props_val, sizeof(agtype_value));
+
+        /* if it isn't the top, we need to adjust the copied value */
+        if (!top)
+        {
+            last_updated_value->type = AGTV_VERTEX;
+            last_updated_value->val.vertex = agtv->val.vertex;
+        }
     }
     /* check for a cast to an edge */
     else if (len == 4 && pg_strncasecmp(annotation, "edge", len) == 0)
     {
+        agtype_value *id_val = NULL;
+        agtype_value *label_val = NULL;
+        agtype_value *start_id_val = NULL;
+        agtype_value *end_id_val = NULL;
+        agtype_value *props_val = NULL;
+        int i;
+
         /* verify that the structure conforms to a valid edge */
-        if (is_object_edge(agtv))
-        {
-            agtv->type = AGTV_EDGE;
-            /* if it isn't the top, we need to adjust the copied value */
-            if (!top)
-                last_updated_value->type = AGTV_EDGE;
-        }
-        else
+        if (!is_object_edge(agtv))
         {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("object is not a edge")));
+        }
+
+        /* Extract id, label, start_id, end_id, properties from the object */
+        for (i = 0; i < agtv->val.object.num_pairs; i++)
+        {
+            agtype_pair *pair = &agtv->val.object.pairs[i];
+            char *key = pair->key.val.string.val;
+            int key_len = pair->key.val.string.len;
+
+            if (key_len == 2 && strncmp(key, "id", 2) == 0)
+                id_val = &pair->value;
+            else if (key_len == 5 && strncmp(key, "label", 5) == 0)
+                label_val = &pair->value;
+            else if (key_len == 8 && strncmp(key, "start_id", 8) == 0)
+                start_id_val = &pair->value;
+            else if (key_len == 6 && strncmp(key, "end_id", 6) == 0)
+                end_id_val = &pair->value;
+            else if (key_len == 10 && strncmp(key, "properties", 10) == 0)
+                props_val = &pair->value;
+        }
+
+        /* Convert to new struct format */
+        agtv->type = AGTV_EDGE;
+        agtv->val.edge.id = id_val->val.int_value;
+        agtv->val.edge.label_id = InvalidOid;
+        agtv->val.edge.start_id = start_id_val->val.int_value;
+        agtv->val.edge.end_id = end_id_val->val.int_value;
+        agtv->val.edge.label_len = label_val->val.string.len;
+        agtv->val.edge.label = label_val->val.string.val;
+
+        /* Copy properties - allocate a new agtype_value */
+        agtv->val.edge.properties = palloc(sizeof(agtype_value));
+        memcpy(agtv->val.edge.properties, props_val, sizeof(agtype_value));
+
+        /* if it isn't the top, we need to adjust the copied value */
+        if (!top)
+        {
+            last_updated_value->type = AGTV_EDGE;
+            last_updated_value->val.edge = agtv->val.edge;
         }
     }
     /* otherwise this isn't a supported typecast */
@@ -881,8 +950,37 @@ static void agtype_put_escaped_value(StringInfo out, agtype_value *scalar_val,
     case AGTV_VERTEX:
     {
         agtype *prop;
-        scalar_val->type = AGTV_OBJECT;
-        prop = agtype_value_to_agtype(scalar_val);
+        agtype_value obj;
+        agtype_pair pairs[3];
+
+        /* Build object from vertex struct: {id, label, properties} */
+        obj.type = AGTV_OBJECT;
+        obj.val.object.num_pairs = 3;
+        obj.val.object.pairs = pairs;
+
+        /* id pair */
+        pairs[0].key.type = AGTV_STRING;
+        pairs[0].key.val.string.val = "id";
+        pairs[0].key.val.string.len = 2;
+        pairs[0].value.type = AGTV_INTEGER;
+        pairs[0].value.val.int_value = AGTV_GET_VERTEX_ID(scalar_val);
+
+        /* label pair */
+        pairs[1].key.type = AGTV_STRING;
+        pairs[1].key.val.string.val = "label";
+        pairs[1].key.val.string.len = 5;
+        pairs[1].value.type = AGTV_STRING;
+        pairs[1].value.val.string.val = AGTV_GET_VERTEX_LABEL(scalar_val);
+        pairs[1].value.val.string.len = AGTV_GET_VERTEX_LABEL_LEN(scalar_val);
+
+        /* properties pair */
+        pairs[2].key.type = AGTV_STRING;
+        pairs[2].key.val.string.val = "properties";
+        pairs[2].key.val.string.len = 10;
+        memcpy(&pairs[2].value, AGTV_GET_VERTEX_PROPERTIES(scalar_val),
+               sizeof(agtype_value));
+
+        prop = agtype_value_to_agtype(&obj);
         agtype_to_cstring_worker(out, &prop->root, prop->vl_len_,
                                  false, extend);
         if (extend)
@@ -894,8 +992,51 @@ static void agtype_put_escaped_value(StringInfo out, agtype_value *scalar_val,
     case AGTV_EDGE:
     {
         agtype *prop;
-        scalar_val->type = AGTV_OBJECT;
-        prop = agtype_value_to_agtype(scalar_val);
+        agtype_value obj;
+        agtype_pair pairs[5];
+
+        /* Build object from edge struct: {id, label, end_id, start_id, properties} */
+        obj.type = AGTV_OBJECT;
+        obj.val.object.num_pairs = 5;
+        obj.val.object.pairs = pairs;
+
+        /* id pair */
+        pairs[0].key.type = AGTV_STRING;
+        pairs[0].key.val.string.val = "id";
+        pairs[0].key.val.string.len = 2;
+        pairs[0].value.type = AGTV_INTEGER;
+        pairs[0].value.val.int_value = AGTV_GET_EDGE_ID(scalar_val);
+
+        /* label pair */
+        pairs[1].key.type = AGTV_STRING;
+        pairs[1].key.val.string.val = "label";
+        pairs[1].key.val.string.len = 5;
+        pairs[1].value.type = AGTV_STRING;
+        pairs[1].value.val.string.val = AGTV_GET_EDGE_LABEL(scalar_val);
+        pairs[1].value.val.string.len = AGTV_GET_EDGE_LABEL_LEN(scalar_val);
+
+        /* end_id pair */
+        pairs[2].key.type = AGTV_STRING;
+        pairs[2].key.val.string.val = "end_id";
+        pairs[2].key.val.string.len = 6;
+        pairs[2].value.type = AGTV_INTEGER;
+        pairs[2].value.val.int_value = AGTV_GET_EDGE_END_ID(scalar_val);
+
+        /* start_id pair */
+        pairs[3].key.type = AGTV_STRING;
+        pairs[3].key.val.string.val = "start_id";
+        pairs[3].key.val.string.len = 8;
+        pairs[3].value.type = AGTV_INTEGER;
+        pairs[3].value.val.int_value = AGTV_GET_EDGE_START_ID(scalar_val);
+
+        /* properties pair */
+        pairs[4].key.type = AGTV_STRING;
+        pairs[4].key.val.string.val = "properties";
+        pairs[4].key.val.string.len = 10;
+        memcpy(&pairs[4].value, AGTV_GET_EDGE_PROPERTIES(scalar_val),
+               sizeof(agtype_value));
+
+        prop = agtype_value_to_agtype(&obj);
         agtype_to_cstring_worker(out, &prop->root, prop->vl_len_,
                                  false, extend);
         if (extend)
@@ -3642,6 +3783,78 @@ agtype_value *get_agtype_value_object_value(const agtype_value *agtv_object,
         return NULL;
     }
 
+    /*
+     * Handle AGTV_VERTEX and AGTV_EDGE with direct struct access
+     * instead of binary search through pairs.
+     */
+    if (agtv_object->type == AGTV_VERTEX)
+    {
+        if (search_key_length == 2 && strncmp(search_key, "id", 2) == 0)
+        {
+            agtype_value *id_val = palloc(sizeof(agtype_value));
+            id_val->type = AGTV_INTEGER;
+            id_val->val.int_value = agtv_object->val.vertex.id;
+            return id_val;
+        }
+        if (search_key_length == 5 && strncmp(search_key, "label", 5) == 0)
+        {
+            agtype_value *label_val = palloc(sizeof(agtype_value));
+            label_val->type = AGTV_STRING;
+            label_val->val.string.len = agtv_object->val.vertex.label_len;
+            label_val->val.string.val = agtv_object->val.vertex.label;
+            return label_val;
+        }
+        if (search_key_length == 10 && strncmp(search_key, "properties", 10) == 0)
+        {
+            return agtv_object->val.vertex.properties;
+        }
+        return NULL;
+    }
+
+    if (agtv_object->type == AGTV_EDGE)
+    {
+        if (search_key_length == 2 && strncmp(search_key, "id", 2) == 0)
+        {
+            agtype_value *id_val = palloc(sizeof(agtype_value));
+            id_val->type = AGTV_INTEGER;
+            id_val->val.int_value = agtv_object->val.edge.id;
+            return id_val;
+        }
+        if (search_key_length == 5 && strncmp(search_key, "label", 5) == 0)
+        {
+            agtype_value *label_val = palloc(sizeof(agtype_value));
+            label_val->type = AGTV_STRING;
+            label_val->val.string.len = agtv_object->val.edge.label_len;
+            label_val->val.string.val = agtv_object->val.edge.label;
+            return label_val;
+        }
+        if (search_key_length == 8 && strncmp(search_key, "start_id", 8) == 0)
+        {
+            agtype_value *start_id_val = palloc(sizeof(agtype_value));
+            start_id_val->type = AGTV_INTEGER;
+            start_id_val->val.int_value = agtv_object->val.edge.start_id;
+            return start_id_val;
+        }
+        if (search_key_length == 6 && strncmp(search_key, "end_id", 6) == 0)
+        {
+            agtype_value *end_id_val = palloc(sizeof(agtype_value));
+            end_id_val->type = AGTV_INTEGER;
+            end_id_val->val.int_value = agtv_object->val.edge.end_id;
+            return end_id_val;
+        }
+        if (search_key_length == 10 && strncmp(search_key, "properties", 10) == 0)
+        {
+            return agtv_object->val.edge.properties;
+        }
+        return NULL;
+    }
+
+    /* For regular objects, use binary search through pairs */
+    if (agtv_object->type != AGTV_OBJECT)
+    {
+        return NULL;
+    }
+
     /* get the number of object pairs */
     num_pairs = agtv_object->val.object.num_pairs;
 
@@ -4189,16 +4402,16 @@ Datum agtype_access_operator(PG_FUNCTION_ARGS)
 
         /*
          * Check for a vertex or edge container_value and extract the properties
-         * object.
+         * object directly from the new struct format.
          */
         if ((container_value != NULL &&
              (container_value->type == AGTV_EDGE ||
               container_value->type == AGTV_VERTEX)))
         {
-            /* both are objects, get the properties object */
+            /* get the properties object directly from the new struct format */
             container_value = (container_value->type == AGTV_EDGE)
-                ? &container_value->val.object.pairs[4].value
-                : &container_value->val.object.pairs[2].value;
+                ? container_value->val.edge.properties
+                : container_value->val.vertex.properties;
         }
 
         /*
@@ -5385,7 +5598,7 @@ Datum age_id(PG_FUNCTION_ARGS)
 {
     agtype *agt_arg = NULL;
     agtype_value *agtv_object = NULL;
-    agtype_value *agtv_result = NULL;
+    agtype_value agtv_result;
 
     /* check for null */
     if (PG_ARGISNULL(0))
@@ -5409,12 +5622,11 @@ Datum age_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("id() argument must be a vertex, an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "id");
+    /* Use the new struct format to get the id directly */
+    agtv_result.type = AGTV_INTEGER;
+    agtv_result.val.int_value = AGTV_GET_ENTITY_ID(agtv_object);
 
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
-
-    PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
+    PG_RETURN_POINTER(agtype_value_to_agtype(&agtv_result));
 }
 
 PG_FUNCTION_INFO_V1(age_start_id);
@@ -5423,7 +5635,7 @@ Datum age_start_id(PG_FUNCTION_ARGS)
 {
     agtype *agt_arg = NULL;
     agtype_value *agtv_object = NULL;
-    agtype_value *agtv_result = NULL;
+    agtype_value agtv_result;
 
     /* check for null */
     if (PG_ARGISNULL(0))
@@ -5447,12 +5659,11 @@ Datum age_start_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("start_id() argument must be an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "start_id");
+    /* Use the new struct format to get the start_id directly */
+    agtv_result.type = AGTV_INTEGER;
+    agtv_result.val.int_value = AGTV_GET_EDGE_START_ID(agtv_object);
 
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
-
-    PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
+    PG_RETURN_POINTER(agtype_value_to_agtype(&agtv_result));
 }
 
 PG_FUNCTION_INFO_V1(age_end_id);
@@ -5461,7 +5672,7 @@ Datum age_end_id(PG_FUNCTION_ARGS)
 {
     agtype *agt_arg = NULL;
     agtype_value *agtv_object = NULL;
-    agtype_value *agtv_result = NULL;
+    agtype_value agtv_result;
 
     /* check for null */
     if (PG_ARGISNULL(0))
@@ -5485,12 +5696,11 @@ Datum age_end_id(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("end_id() argument must be an edge or null")));
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "end_id");
+    /* Use the new struct format to get the end_id directly */
+    agtv_result.type = AGTV_INTEGER;
+    agtv_result.val.int_value = AGTV_GET_EDGE_END_ID(agtv_object);
 
-    Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_INTEGER);
-
-    PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
+    PG_RETURN_POINTER(agtype_value_to_agtype(&agtv_result));
 }
 
 /*
@@ -6038,10 +6248,10 @@ Datum age_properties(PG_FUNCTION_ARGS)
                         errmsg("properties() argument must be a vertex, an edge or null")));
     }
 
-    agtv_result = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_object, "properties");
+    /* Use the new struct format to get properties directly */
+    agtv_result = AGTV_GET_ENTITY_PROPERTIES(agtv_object);
 
     Assert(agtv_result != NULL);
-    Assert(agtv_result->type = AGTV_OBJECT);
 
     PG_RETURN_POINTER(agtype_value_to_agtype(agtv_result));
 }
@@ -7140,7 +7350,7 @@ Datum age_label(PG_FUNCTION_ARGS)
 {
     agtype *agt_arg = NULL;
     agtype_value *agtv_value = NULL;
-    agtype_value *label = NULL;
+    agtype_value label;
 
     /* check for NULL, NULL is FALSE */
     if (PG_ARGISNULL(0))
@@ -7170,10 +7380,12 @@ Datum age_label(PG_FUNCTION_ARGS)
 
     }
 
-    /* extract the label agtype value from the vertex or edge */
-    label = GET_AGTYPE_VALUE_OBJECT_VALUE(agtv_value, "label");
+    /* Use the new struct format to get label directly */
+    label.type = AGTV_STRING;
+    label.val.string.val = AGTV_GET_ENTITY_LABEL(agtv_value);
+    label.val.string.len = AGTV_GET_ENTITY_LABEL_LEN(agtv_value);
 
-    PG_RETURN_POINTER(agtype_value_to_agtype(label));
+    PG_RETURN_POINTER(agtype_value_to_agtype(&label));
 }
 
 PG_FUNCTION_INFO_V1(age_tostring);
@@ -11239,95 +11451,106 @@ Datum age_collect_aggfinalfn(PG_FUNCTION_ARGS)
 agtype_value *agtype_value_build_vertex(graphid id, char *label,
                                         Datum properties)
 {
-    agtype_in_state result;
+    agtype_value *result;
+    agtype_value *props_value;
+    int label_len;
 
     /* the label can't be NULL */
     Assert(label != NULL);
 
-    memset(&result, 0, sizeof(agtype_in_state));
+    label_len = strlen(label);
 
-    /* push in the object beginning */
-    result.res = push_agtype_value(&result.parse_state, WAGT_BEGIN_OBJECT,
-                                   NULL);
+    /* allocate the result agtype_value */
+    result = palloc0(sizeof(agtype_value));
+    result->type = AGTV_VERTEX;
 
-    /* push the graph id key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   integer_to_agtype_value(id));
+    /* set the vertex id */
+    result->val.vertex.id = id;
 
-    /* push the label key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("label"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   string_to_agtype_value(label));
+    /* set the label_id to InvalidOid for now (can be set later) */
+    result->val.vertex.label_id = InvalidOid;
 
-    /* push the properties key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("properties"));
-    add_agtype((Datum)properties, false, &result, AGTYPEOID, false);
+    /* copy the label string */
+    result->val.vertex.label_len = label_len;
+    result->val.vertex.label = pnstrdup(label, label_len);
 
-    /* push in the object end */
-    result.res = push_agtype_value(&result.parse_state, WAGT_END_OBJECT, NULL);
+    /* handle properties - convert from Datum to agtype_value */
+    if (DatumGetPointer(properties) != NULL)
+    {
+        agtype *props_agt = DATUM_GET_AGTYPE_P(properties);
 
-    /* set it as an edge */
-    result.res->type = AGTV_VERTEX;
+        /* allocate and set up the properties agtype_value */
+        props_value = palloc0(sizeof(agtype_value));
+        props_value->type = AGTV_BINARY;
+        props_value->val.binary.len = VARSIZE(props_agt) - VARHDRSZ;
+        props_value->val.binary.data = &props_agt->root;
+    }
+    else
+    {
+        /* create an empty object for NULL properties */
+        props_value = palloc0(sizeof(agtype_value));
+        props_value->type = AGTV_OBJECT;
+        props_value->val.object.num_pairs = 0;
+        props_value->val.object.pairs = NULL;
+    }
+    result->val.vertex.properties = props_value;
 
-    /* return the result that was build (allocated) inside the result */
-    return result.res;
+    return result;
 }
 
 /* helper function to quickly build an agtype_value edge */
 agtype_value *agtype_value_build_edge(graphid id, char *label, graphid end_id,
                                       graphid start_id, Datum properties)
 {
-    agtype_in_state result;
+    agtype_value *result;
+    agtype_value *props_value;
+    int label_len;
 
     /* the label can't be NULL */
     Assert(label != NULL);
 
-    memset(&result, 0, sizeof(agtype_in_state));
+    label_len = strlen(label);
 
-    /* push in the object beginning */
-    result.res = push_agtype_value(&result.parse_state, WAGT_BEGIN_OBJECT,
-                                   NULL);
-    /* push the graph id key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   integer_to_agtype_value(id));
+    /* allocate the result agtype_value */
+    result = palloc0(sizeof(agtype_value));
+    result->type = AGTV_EDGE;
 
-    /* push the label key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("label"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   string_to_agtype_value(label));
+    /* set the edge id */
+    result->val.edge.id = id;
 
-    /* push the end_id key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("end_id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   integer_to_agtype_value(end_id));
+    /* set the label_id to InvalidOid for now (can be set later) */
+    result->val.edge.label_id = InvalidOid;
 
-    /* push the start_id key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("start_id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                   integer_to_agtype_value(start_id));
+    /* set start and end ids */
+    result->val.edge.start_id = start_id;
+    result->val.edge.end_id = end_id;
 
-    /* push the properties key/value pair */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("properties"));
-    add_agtype((Datum)properties, false, &result, AGTYPEOID, false);
+    /* copy the label string */
+    result->val.edge.label_len = label_len;
+    result->val.edge.label = pnstrdup(label, label_len);
 
-    /* push in the object end */
-    result.res = push_agtype_value(&result.parse_state, WAGT_END_OBJECT, NULL);
+    /* handle properties - convert from Datum to agtype_value */
+    if (DatumGetPointer(properties) != NULL)
+    {
+        agtype *props_agt = DATUM_GET_AGTYPE_P(properties);
 
-    /* set it as an edge */
-    result.res->type = AGTV_EDGE;
+        /* allocate and set up the properties agtype_value */
+        props_value = palloc0(sizeof(agtype_value));
+        props_value->type = AGTV_BINARY;
+        props_value->val.binary.len = VARSIZE(props_agt) - VARHDRSZ;
+        props_value->val.binary.data = &props_agt->root;
+    }
+    else
+    {
+        /* create an empty object for NULL properties */
+        props_value = palloc0(sizeof(agtype_value));
+        props_value->type = AGTV_OBJECT;
+        props_value->val.object.num_pairs = 0;
+        props_value->val.object.pairs = NULL;
+    }
+    result->val.edge.properties = props_value;
 
-    /* return the result that was build (allocated) inside the result */
-    return result.res;
+    return result;
 }
 
 /*
@@ -11405,11 +11628,11 @@ agtype_value *extract_entity_properties(agtype *object, bool error_on_scalar)
     /* get the properties depending on the type or fail */
     if (scalar_value->type == AGTV_VERTEX)
     {
-        return_value = &scalar_value->val.object.pairs[2].value;
+        return_value = scalar_value->val.vertex.properties;
     }
     else if (scalar_value->type == AGTV_EDGE)
     {
-        return_value = &scalar_value->val.object.pairs[4].value;
+        return_value = scalar_value->val.edge.properties;
     }
     else if (scalar_value->type == AGTV_PATH)
     {

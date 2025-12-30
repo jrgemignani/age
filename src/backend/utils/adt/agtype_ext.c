@@ -25,6 +25,10 @@
 
 static void ag_deserialize_composite(char *base, enum agtype_value_type type,
                                      agtype_value *result);
+static void convert_vertex_to_object(StringInfo buffer, agtentry *pheader,
+                                     agtype_value *val);
+static void convert_edge_to_object(StringInfo buffer, agtentry *pheader,
+                                   agtype_value *val);
 
 static short ag_serialize_header(StringInfo buffer, uint32 type)
 {
@@ -78,7 +82,7 @@ bool ag_serialize_extended_type(StringInfo buffer, agtentry *agtentry,
         uint32 object_ae = 0;
 
         padlen = ag_serialize_header(buffer, AGT_HEADER_VERTEX);
-        convert_extended_object(buffer, &object_ae, scalar_val);
+        convert_vertex_to_object(buffer, &object_ae, scalar_val);
 
         /*
          * Make sure that the end of the buffer is padded to the next offset and
@@ -98,7 +102,7 @@ bool ag_serialize_extended_type(StringInfo buffer, agtentry *agtentry,
         uint32 object_ae = 0;
 
         padlen = ag_serialize_header(buffer, AGT_HEADER_EDGE);
-        convert_extended_object(buffer, &object_ae, scalar_val);
+        convert_edge_to_object(buffer, &object_ae, scalar_val);
 
         /*
          * Make sure that the end of the buffer is padded to the next offset and
@@ -181,6 +185,8 @@ void ag_deserialize_extended_type(char *base_addr, uint32 offset,
 
 /*
  * Deserializes a composite type.
+ * For AGTV_VERTEX and AGTV_EDGE, populates the new struct format.
+ * For AGTV_PATH, uses the object/array format.
  */
 static void ag_deserialize_composite(char *base, enum agtype_value_type type,
                                      agtype_value *result)
@@ -196,12 +202,237 @@ static void ag_deserialize_composite(char *base, enum agtype_value_type type,
     r = palloc(sizeof(agtype_value));
 
     it = agtype_iterator_init((agtype_container *)container_base);
-    while ((tok = agtype_iterator_next(&it, r, true)) != WAGT_DONE)
+    /*
+     * Use skip_nested = false to recurse into nested containers like
+     * path elements, ensuring vertices and edges are properly deserialized.
+     */
+    while ((tok = agtype_iterator_next(&it, r, false)) != WAGT_DONE)
     {
         parsed_agtype_value = push_agtype_value(
             &parse_state, tok, tok < WAGT_BEGIN_ARRAY ? r : NULL);
     }
 
     result->type = type;
-    result->val = parsed_agtype_value->val;
+
+    /* For vertex and edge, convert from object format to new struct format */
+    if (type == AGTV_VERTEX)
+    {
+        agtype_value *id_val = NULL;
+        agtype_value *label_val = NULL;
+        agtype_value *props_val = NULL;
+        int i;
+
+        /* Verify parsed object */
+        if (parsed_agtype_value == NULL ||
+            parsed_agtype_value->type != AGTV_OBJECT)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("invalid vertex format: expected object")));
+        }
+
+        /* Extract id, label, properties from the parsed object */
+        for (i = 0; i < parsed_agtype_value->val.object.num_pairs; i++)
+        {
+            agtype_pair *pair = &parsed_agtype_value->val.object.pairs[i];
+            char *key = pair->key.val.string.val;
+            int key_len = pair->key.val.string.len;
+
+            if (key_len == 2 && strncmp(key, "id", 2) == 0)
+                id_val = &pair->value;
+            else if (key_len == 5 && strncmp(key, "label", 5) == 0)
+                label_val = &pair->value;
+            else if (key_len == 10 && strncmp(key, "properties", 10) == 0)
+                props_val = &pair->value;
+        }
+
+        /* Verify all required fields are present */
+        if (id_val == NULL || label_val == NULL || props_val == NULL)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("invalid vertex format: missing required field")));
+        }
+
+        /* Populate the vertex struct */
+        result->val.vertex.id = id_val->val.int_value;
+        result->val.vertex.label_id = InvalidOid;
+        result->val.vertex.label_len = label_val->val.string.len;
+        /* Deep copy the label string */
+        result->val.vertex.label = palloc(label_val->val.string.len + 1);
+        memcpy(result->val.vertex.label, label_val->val.string.val,
+               label_val->val.string.len);
+        result->val.vertex.label[label_val->val.string.len] = '\0';
+
+        /* Store properties - allocate a new agtype_value for them */
+        result->val.vertex.properties = palloc(sizeof(agtype_value));
+        memcpy(result->val.vertex.properties, props_val, sizeof(agtype_value));
+    }
+    else if (type == AGTV_EDGE)
+    {
+        agtype_value *id_val = NULL;
+        agtype_value *label_val = NULL;
+        agtype_value *start_id_val = NULL;
+        agtype_value *end_id_val = NULL;
+        agtype_value *props_val = NULL;
+        int i;
+
+        /* Verify parsed object */
+        if (parsed_agtype_value == NULL ||
+            parsed_agtype_value->type != AGTV_OBJECT)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("invalid edge format: expected object")));
+        }
+
+        /* Extract id, label, start_id, end_id, properties from the parsed object */
+        for (i = 0; i < parsed_agtype_value->val.object.num_pairs; i++)
+        {
+            agtype_pair *pair = &parsed_agtype_value->val.object.pairs[i];
+            char *key = pair->key.val.string.val;
+            int key_len = pair->key.val.string.len;
+
+            if (key_len == 2 && strncmp(key, "id", 2) == 0)
+                id_val = &pair->value;
+            else if (key_len == 5 && strncmp(key, "label", 5) == 0)
+                label_val = &pair->value;
+            else if (key_len == 8 && strncmp(key, "start_id", 8) == 0)
+                start_id_val = &pair->value;
+            else if (key_len == 6 && strncmp(key, "end_id", 6) == 0)
+                end_id_val = &pair->value;
+            else if (key_len == 10 && strncmp(key, "properties", 10) == 0)
+                props_val = &pair->value;
+        }
+
+        /* Verify all required fields are present */
+        if (id_val == NULL || label_val == NULL || start_id_val == NULL ||
+            end_id_val == NULL || props_val == NULL)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("invalid edge format: missing required field")));
+        }
+
+        /* Populate the edge struct */
+        result->val.edge.id = id_val->val.int_value;
+        result->val.edge.label_id = InvalidOid;
+        result->val.edge.start_id = start_id_val->val.int_value;
+        result->val.edge.end_id = end_id_val->val.int_value;
+        result->val.edge.label_len = label_val->val.string.len;
+        /* Deep copy the label string */
+        result->val.edge.label = palloc(label_val->val.string.len + 1);
+        memcpy(result->val.edge.label, label_val->val.string.val,
+               label_val->val.string.len);
+        result->val.edge.label[label_val->val.string.len] = '\0';
+
+        /* Store properties - allocate a new agtype_value for them */
+        result->val.edge.properties = palloc(sizeof(agtype_value));
+        memcpy(result->val.edge.properties, props_val, sizeof(agtype_value));
+    }
+    else
+    {
+        /* For PATH and other types, just copy the val union */
+        result->val = parsed_agtype_value->val;
+    }
+}
+
+/*
+ * Helper to set up a string key in an agtype_pair.
+ */
+static void set_pair_key(agtype_pair *pair, const char *key, int len)
+{
+    pair->key.type = AGTV_STRING;
+    pair->key.val.string.len = len;
+    pair->key.val.string.val = (char *)key;
+}
+
+/*
+ * Helper to set up an integer value in an agtype_pair.
+ */
+static void set_pair_int_value(agtype_pair *pair, int64 value)
+{
+    pair->value.type = AGTV_INTEGER;
+    pair->value.val.int_value = value;
+}
+
+/*
+ * Helper to set up a string value in an agtype_pair.
+ */
+static void set_pair_string_value(agtype_pair *pair, const char *str, int len)
+{
+    pair->value.type = AGTV_STRING;
+    pair->value.val.string.len = len;
+    pair->value.val.string.val = (char *)str;
+}
+
+/*
+ * Convert a vertex (new struct format) to on-disk object format.
+ * Builds an agtype_value object and uses convert_extended_object.
+ * The on-disk format is: {"id": <graphid>, "label": <string>, "properties": <object>}
+ */
+static void convert_vertex_to_object(StringInfo buffer, agtentry *pheader,
+                                     agtype_value *val)
+{
+    agtype_value obj;
+    agtype_pair pairs[3];
+
+    /* Build the object structure */
+    obj.type = AGTV_OBJECT;
+    obj.val.object.num_pairs = 3;
+    obj.val.object.pairs = pairs;
+
+    /* Set up id pair */
+    set_pair_key(&pairs[0], "id", 2);
+    set_pair_int_value(&pairs[0], val->val.vertex.id);
+
+    /* Set up label pair */
+    set_pair_key(&pairs[1], "label", 5);
+    set_pair_string_value(&pairs[1], val->val.vertex.label,
+                          val->val.vertex.label_len);
+
+    /* Set up properties pair */
+    set_pair_key(&pairs[2], "properties", 10);
+    memcpy(&pairs[2].value, val->val.vertex.properties, sizeof(agtype_value));
+
+    /* Use existing serialization infrastructure */
+    convert_extended_object(buffer, pheader, &obj);
+}
+
+/*
+ * Convert an edge (new struct format) to on-disk object format.
+ * Builds an agtype_value object and uses convert_extended_object.
+ * The on-disk format is: {"id": <graphid>, "label": <string>, "end_id": <graphid>,
+ *                         "start_id": <graphid>, "properties": <object>}
+ */
+static void convert_edge_to_object(StringInfo buffer, agtentry *pheader,
+                                   agtype_value *val)
+{
+    agtype_value obj;
+    agtype_pair pairs[5];
+
+    /* Build the object structure */
+    obj.type = AGTV_OBJECT;
+    obj.val.object.num_pairs = 5;
+    obj.val.object.pairs = pairs;
+
+    /* Set up pairs in the order expected by AGE: id, label, end_id, start_id, properties */
+    set_pair_key(&pairs[0], "id", 2);
+    set_pair_int_value(&pairs[0], val->val.edge.id);
+
+    set_pair_key(&pairs[1], "label", 5);
+    set_pair_string_value(&pairs[1], val->val.edge.label,
+                          val->val.edge.label_len);
+
+    set_pair_key(&pairs[2], "end_id", 6);
+    set_pair_int_value(&pairs[2], val->val.edge.end_id);
+
+    set_pair_key(&pairs[3], "start_id", 8);
+    set_pair_int_value(&pairs[3], val->val.edge.start_id);
+
+    set_pair_key(&pairs[4], "properties", 10);
+    memcpy(&pairs[4].value, val->val.edge.properties, sizeof(agtype_value));
+
+    /* Use existing serialization infrastructure */
+    convert_extended_object(buffer, pheader, &obj);
 }

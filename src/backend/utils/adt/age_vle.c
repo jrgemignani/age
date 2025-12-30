@@ -1554,13 +1554,16 @@ static agtype_value *build_edge_list(VLE_path_container *vpc)
 
         /* get the edge entry from the hashtable */
         ee = get_edge_entry(ggctx, graphid_array[index]);
+
         /* get the label name from the oid */
         label_name = get_rel_name(get_edge_entry_label_table_oid(ee));
+
         /* reconstruct the edge */
         agtv_edge = agtype_value_build_edge(get_edge_entry_id(ee), label_name,
                                             get_edge_entry_end_vertex_id(ee),
                                             get_edge_entry_start_vertex_id(ee),
                                             get_edge_entry_properties(ee));
+
         /* push the edge*/
         edges_result.res = push_agtype_value(&edges_result.parse_state,
                                              WAGT_ELEM, agtv_edge);
@@ -2345,62 +2348,27 @@ PG_FUNCTION_INFO_V1(age_build_vle_match_edge);
 
 Datum age_build_vle_match_edge(PG_FUNCTION_ARGS)
 {
-    agtype_in_state result;
-    agtype_value agtv_zero;
-    agtype_value agtv_nstr;
+    agtype_value *agtv_edge = NULL;
     agtype_value *agtv_temp = NULL;
+    agtype_value *props_agtv = NULL;
+    char *label_str = NULL;
 
-    /* create an agtype_value integer 0 */
-    agtv_zero.type = AGTV_INTEGER;
-    agtv_zero.val.int_value = 0;
-
-    /* create an agtype_value null string */
-    agtv_nstr.type = AGTV_STRING;
-    agtv_nstr.val.string.len = 0;
-    agtv_nstr.val.string.val = NULL;
-
-    /* zero the state */
-    memset(&result, 0, sizeof(agtype_in_state));
-
-    /* start the object */
-    result.res = push_agtype_value(&result.parse_state, WAGT_BEGIN_OBJECT,
-                                   NULL);
-    /* create dummy graph id */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE, &agtv_zero);
-    /* process the label */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("label"));
+    /* Get the label if provided */
     if (!PG_ARGISNULL(0))
     {
         agtv_temp = get_agtype_value("build_vle_match_edge",
                                      AG_GET_ARG_AGTYPE_P(0), AGTV_STRING, true);
-        result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                       agtv_temp);
+        label_str = pnstrdup(agtv_temp->val.string.val, agtv_temp->val.string.len);
     }
     else
     {
-        result.res = push_agtype_value(&result.parse_state, WAGT_VALUE,
-                                       &agtv_nstr);
+        label_str = pstrdup("");
     }
-    /* create dummy end_id */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("end_id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE, &agtv_zero);
-    /* create dummy start_id */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("start_id"));
-    result.res = push_agtype_value(&result.parse_state, WAGT_VALUE, &agtv_zero);
 
-    /* process the properties */
-    result.res = push_agtype_value(&result.parse_state, WAGT_KEY,
-                                   string_to_agtype_value("properties"));
+    /* Get the properties if provided */
     if (!PG_ARGISNULL(1))
     {
-        agtype *properties = NULL;
-
-        properties = AG_GET_ARG_AGTYPE_P(1);
+        agtype *properties = AG_GET_ARG_AGTYPE_P(1);
 
         if (!AGT_ROOT_IS_OBJECT(properties))
         {
@@ -2409,22 +2377,33 @@ Datum age_build_vle_match_edge(PG_FUNCTION_ARGS)
                      errmsg("build_vle_match_edge(): properties argument must be an object")));
         }
 
-        add_agtype((Datum)properties, false, &result, AGTYPEOID, false);
-
+        /* Create a BINARY agtype_value for the properties */
+        props_agtv = palloc(sizeof(agtype_value));
+        props_agtv->type = AGTV_BINARY;
+        props_agtv->val.binary.len = VARSIZE(properties) - VARHDRSZ;
+        props_agtv->val.binary.data = &properties->root;
     }
     else
     {
-        result.res = push_agtype_value(&result.parse_state, WAGT_BEGIN_OBJECT,
-                                       NULL);
-        result.res = push_agtype_value(&result.parse_state, WAGT_END_OBJECT,
-                                       NULL);
+        /* Create an empty object for properties */
+        props_agtv = palloc0(sizeof(agtype_value));
+        props_agtv->type = AGTV_OBJECT;
+        props_agtv->val.object.num_pairs = 0;
+        props_agtv->val.object.pairs = NULL;
     }
 
-    result.res = push_agtype_value(&result.parse_state, WAGT_END_OBJECT, NULL);
+    /* Allocate and populate the edge agtype_value using the new struct format */
+    agtv_edge = palloc0(sizeof(agtype_value));
+    agtv_edge->type = AGTV_EDGE;
+    agtv_edge->val.edge.id = 0;  /* dummy id */
+    agtv_edge->val.edge.label_id = InvalidOid;
+    agtv_edge->val.edge.start_id = 0;  /* dummy start_id */
+    agtv_edge->val.edge.end_id = 0;  /* dummy end_id */
+    agtv_edge->val.edge.label_len = strlen(label_str);
+    agtv_edge->val.edge.label = label_str;
+    agtv_edge->val.edge.properties = props_agtv;
 
-    result.res->type = AGTV_EDGE;
-
-    PG_RETURN_POINTER(agtype_value_to_agtype(result.res));
+    PG_RETURN_POINTER(agtype_value_to_agtype(agtv_edge));
 }
 
 PG_FUNCTION_INFO_V1(_ag_enforce_edge_uniqueness2);
