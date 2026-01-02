@@ -89,6 +89,7 @@ REGRESS = scan \
           graphid \
           agtype \
           agtype_hash_cmp \
+          agtype_access \
           catalog \
           cypher \
           expr \

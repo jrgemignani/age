@@ -23,6 +23,18 @@
 #define AGT_HEADER_TYPE uint32
 #define AGT_HEADER_SIZE sizeof(AGT_HEADER_TYPE)
 
+/*
+ * Vertex structure: {id, label, properties}
+ * Properties is at value index 2 (3rd value in the object)
+ */
+#define VERTEX_PROPERTIES_INDEX 2
+
+/*
+ * Edge structure: {id, label, end_id, start_id, properties}
+ * Properties is at value index 4 (5th value in the object)
+ */
+#define EDGE_PROPERTIES_INDEX 4
+
 static void ag_deserialize_composite(char *base, enum agtype_value_type type,
                                      agtype_value *result);
 
@@ -204,4 +216,107 @@ static void ag_deserialize_composite(char *base, enum agtype_value_type type,
 
     result->type = type;
     result->val = parsed_agtype_value->val;
+}
+
+/*
+ * Extract the properties container from a binary vertex or edge directly,
+ * without full deserialization.
+ *
+ * This is an optimization for property access. Instead of deserializing
+ * the entire vertex/edge structure just to access a property, we navigate
+ * directly to the properties field using the known structure offsets.
+ *
+ * Parameters:
+ *   - container: The agtype_container of a scalar array containing vertex/edge
+ *   - result: Output agtype_value to fill with the properties (as AGTV_BINARY)
+ *
+ * Returns:
+ *   - AGT_HEADER_VERTEX if the container is a vertex
+ *   - AGT_HEADER_EDGE if the container is an edge
+ *   - 0 if the container is not a vertex or edge
+ *
+ * The result will be filled with AGTV_BINARY pointing to the properties
+ * container, which can then be used for property access.
+ */
+uint32 ag_get_entity_properties_binary(agtype_container *scalar_container,
+                                       agtype_value *result)
+{
+    char *base_addr;
+    uint32 offset;
+    uint32 agt_header;
+    char *entity_base;
+    agtype_container *entity_container;
+    uint32 num_pairs;
+    uint32 properties_index;
+    uint32 actual_index;
+
+    /* Scalar array should have exactly 1 element */
+    if (!AGTYPE_CONTAINER_IS_ARRAY(scalar_container) ||
+        AGTYPE_CONTAINER_SIZE(scalar_container) != 1)
+    {
+        return 0;
+    }
+
+    /* Get the base address for data (after the single agtentry) */
+    base_addr = (char *)&scalar_container->children[1];
+    offset = get_agtype_offset(scalar_container, 0);
+
+    /* Check if this is an extended type (AGTE_IS_AGTYPE) */
+    if (!AGTE_IS_AGTYPE(scalar_container->children[0]))
+    {
+        return 0;
+    }
+
+    /* Read the AGT header to determine vertex or edge */
+    entity_base = base_addr + INTALIGN(offset);
+    agt_header = *((uint32 *)entity_base);
+
+    if (agt_header == AGT_HEADER_VERTEX)
+    {
+        properties_index = VERTEX_PROPERTIES_INDEX;
+    }
+    else if (agt_header == AGT_HEADER_EDGE)
+    {
+        properties_index = EDGE_PROPERTIES_INDEX;
+    }
+    else
+    {
+        /* Not a vertex or edge */
+        return 0;
+    }
+
+    /* The entity container starts after the AGT header */
+    entity_container = (agtype_container *)(entity_base + AGT_HEADER_SIZE);
+
+    /* Verify it's an object with enough pairs */
+    if (!AGTYPE_CONTAINER_IS_OBJECT(entity_container))
+    {
+        return 0;
+    }
+
+    num_pairs = AGTYPE_CONTAINER_SIZE(entity_container);
+    if (properties_index >= num_pairs)
+    {
+        return 0;
+    }
+
+    /* For objects, values start after keys. Index = num_pairs + value_index */
+    actual_index = num_pairs + properties_index;
+    base_addr = (char *)&entity_container->children[num_pairs * 2];
+    offset = get_agtype_offset(entity_container, actual_index);
+
+    /* The properties should be a container (object) */
+    if (!AGTE_IS_CONTAINER(entity_container->children[actual_index]))
+    {
+        return 0;
+    }
+
+    /* Fill result as AGTV_BINARY pointing to the properties container */
+    result->type = AGTV_BINARY;
+    result->val.binary.data =
+        (agtype_container *)(base_addr + INTALIGN(offset));
+    result->val.binary.len = get_agtype_length(entity_container, actual_index) -
+                             (INTALIGN(offset) - offset);
+
+    return agt_header;
 }

@@ -56,6 +56,9 @@
 static void fill_agtype_value(agtype_container *container, int index,
                               char *base_addr, uint32 offset,
                               agtype_value *result);
+static void fill_agtype_value_shallow(agtype_container *container, int index,
+                                      char *base_addr, uint32 offset,
+                                      agtype_value *result);
 static bool equals_agtype_scalar_value(agtype_value *a, agtype_value *b);
 static agtype *convert_to_agtype(agtype_value *val);
 static void convert_agtype_value(StringInfo buffer, agtentry *header,
@@ -591,6 +594,82 @@ agtype_value *get_ith_agtype_value_from_container(agtype_container *container,
 }
 
 /*
+ * Get i-th value of an agtype object (by value position).
+ *
+ * For an object with N key-value pairs, keys are at indices 0..N-1 and
+ * values are at indices N..2N-1. This function gets the value at the
+ * specified value_index (0-based among values, so 0 = first value).
+ *
+ * This is useful for accessing known fields by position in fixed-structure
+ * objects like vertices and edges.
+ *
+ * Returns palloc()'d copy of the value, or NULL if index is out of bounds.
+ */
+agtype_value *get_ith_agtype_object_value(agtype_container *container,
+                                          uint32 value_index)
+{
+    agtype_value *result;
+    char *base_addr;
+    uint32 num_pairs;
+    uint32 actual_index;
+
+    if (!AGTYPE_CONTAINER_IS_OBJECT(container))
+        ereport(ERROR, (errmsg("container is not an agtype object")));
+
+    num_pairs = AGTYPE_CONTAINER_SIZE(container);
+
+    if (value_index >= num_pairs)
+        return NULL;
+
+    /* In objects, values start after all keys: index = num_pairs + value_index */
+    actual_index = num_pairs + value_index;
+    base_addr = (char *)&container->children[num_pairs * 2];
+
+    result = palloc(sizeof(agtype_value));
+    fill_agtype_value(container, actual_index, base_addr,
+                      get_agtype_offset(container, actual_index), result);
+
+    return result;
+}
+
+/*
+ * Shallow/zero-copy version: Fill agtype_value with i-th value of an object.
+ *
+ * This version uses fill_agtype_value_shallow, so strings and numerics
+ * point directly into the container. The result is only valid while
+ * the container is valid.
+ *
+ * result must be a pre-allocated agtype_value (typically stack-allocated).
+ * Returns true if successful, false if index is out of bounds.
+ */
+bool get_ith_agtype_object_value_shallow(agtype_container *container,
+                                         uint32 value_index,
+                                         agtype_value *result)
+{
+    char *base_addr;
+    uint32 num_pairs;
+    uint32 actual_index;
+
+    if (!AGTYPE_CONTAINER_IS_OBJECT(container))
+        ereport(ERROR, (errmsg("container is not an agtype object")));
+
+    num_pairs = AGTYPE_CONTAINER_SIZE(container);
+
+    if (value_index >= num_pairs)
+        return false;
+
+    /* In objects, values start after all keys: index = num_pairs + value_index */
+    actual_index = num_pairs + value_index;
+    base_addr = (char *)&container->children[num_pairs * 2];
+
+    fill_agtype_value_shallow(container, actual_index, base_addr,
+                              get_agtype_offset(container, actual_index),
+                              result);
+
+    return true;
+}
+
+/*
  * Get type of i-th value of an agtype array.
  */
 enum agtype_value_type get_ith_agtype_value_type(agtype_container *container,
@@ -744,6 +823,73 @@ static void fill_agtype_value(agtype_container *container, int index,
         Assert(AGTE_IS_CONTAINER(entry));
         result->type = AGTV_BINARY;
         /* Remove alignment padding from data pointer and length */
+        result->val.binary.data =
+            (agtype_container *)(base_addr + INTALIGN(offset));
+        result->val.binary.len = get_agtype_length(container, index) -
+                                 (INTALIGN(offset) - offset);
+    }
+}
+
+/*
+ * Shallow/zero-copy variant of fill_agtype_value.
+ *
+ * This function fills in an agtype_value WITHOUT making deep copies of
+ * strings or numerics. The result points directly into the container's
+ * memory, so it's only valid while the container is valid.
+ *
+ * Use this for read-only access to values where the container outlives
+ * the agtype_value usage (e.g., extracting a key string for comparison).
+ *
+ * WARNING: The returned agtype_value must NOT be modified or freed.
+ * For strings and numerics, the pointers point into the container.
+ */
+static void fill_agtype_value_shallow(agtype_container *container, int index,
+                                      char *base_addr, uint32 offset,
+                                      agtype_value *result)
+{
+    agtentry entry = container->children[index];
+
+    if (AGTE_IS_NULL(entry))
+    {
+        result->type = AGTV_NULL;
+    }
+    else if (AGTE_IS_STRING(entry))
+    {
+        result->type = AGTV_STRING;
+        /* Direct pointer - NO copy. Valid while container is valid. */
+        result->val.string.val = base_addr + offset;
+        result->val.string.len = get_agtype_length(container, index);
+        Assert(result->val.string.len >= 0);
+    }
+    else if (AGTE_IS_NUMERIC(entry))
+    {
+        result->type = AGTV_NUMERIC;
+        /* Direct pointer - NO copy. Valid while container is valid. */
+        result->val.numeric = (Numeric)(base_addr + INTALIGN(offset));
+    }
+    else if (AGTE_IS_AGTYPE(entry))
+    {
+        /*
+         * Extended types require deserialization - fall back to deep copy.
+         * This is unavoidable as they need parsing.
+         */
+        ag_deserialize_extended_type(base_addr, offset, result);
+    }
+    else if (AGTE_IS_BOOL_TRUE(entry))
+    {
+        result->type = AGTV_BOOL;
+        result->val.boolean = true;
+    }
+    else if (AGTE_IS_BOOL_FALSE(entry))
+    {
+        result->type = AGTV_BOOL;
+        result->val.boolean = false;
+    }
+    else
+    {
+        Assert(AGTE_IS_CONTAINER(entry));
+        result->type = AGTV_BINARY;
+        /* Direct pointer - NO copy */
         result->val.binary.data =
             (agtype_container *)(base_addr + INTALIGN(offset));
         result->val.binary.len = get_agtype_length(container, index) -

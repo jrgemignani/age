@@ -39,4 +39,12 @@ bool ag_serialize_extended_type(StringInfo buffer, agtentry *agtentry,
 void ag_deserialize_extended_type(char *base_addr, uint32 offset,
                                   agtype_value *result);
 
+/*
+ * Extract properties from a binary vertex/edge without full deserialization.
+ * Returns AGT_HEADER_VERTEX or AGT_HEADER_EDGE on success, 0 otherwise.
+ * The result will contain AGTV_BINARY pointing to the properties container.
+ */
+uint32 ag_get_entity_properties_binary(agtype_container *scalar_container,
+                                       agtype_value *result);
+
 #endif

@@ -53,6 +53,7 @@
 #include "utils/agtype_parser.h"
 #include "utils/ag_float8_supp.h"
 #include "utils/agtype_raw.h"
+#include "utils/agtype_ext.h"
 #include "catalog/ag_graph.h"
 #include "catalog/ag_label.h"
 
@@ -3439,21 +3440,101 @@ Datum agtype_to_int4_array(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Helper function to extract scalar key value with zero-copy.
+ *
+ * Fills key_value (stack-allocated) with the first element of the key container.
+ * Uses shallow fill, so strings point directly into the container.
+ * Returns true if successful, false if the container is empty.
+ */
+static bool extract_key_value_shallow(agtype *key, agtype_value *key_value)
+{
+    agtype_container *container = &key->root;
+    uint32 nelements;
+    char *base_addr;
+
+    if (!AGTYPE_CONTAINER_IS_ARRAY(container))
+    {
+        ereport(ERROR, (errmsg("key container is not an agtype array")));
+    }
+
+    nelements = AGTYPE_CONTAINER_SIZE(container);
+    if (nelements == 0)
+        return false;
+
+    base_addr = (char *)&container->children[nelements];
+
+    /* Use shallow fill - strings/numerics point into container memory */
+    {
+        uint32 offset = get_agtype_offset(container, 0);
+        agtentry entry = container->children[0];
+
+        if (AGTE_IS_NULL(entry))
+        {
+            key_value->type = AGTV_NULL;
+        }
+        else if (AGTE_IS_STRING(entry))
+        {
+            key_value->type = AGTV_STRING;
+            /* Direct pointer - NO copy */
+            key_value->val.string.val = base_addr + offset;
+            key_value->val.string.len = get_agtype_length(container, 0);
+        }
+        else if (AGTE_IS_NUMERIC(entry))
+        {
+            key_value->type = AGTV_NUMERIC;
+            /* Direct pointer - NO copy */
+            key_value->val.numeric = (Numeric)(base_addr + INTALIGN(offset));
+        }
+        else if (AGTE_IS_BOOL_TRUE(entry))
+        {
+            key_value->type = AGTV_BOOL;
+            key_value->val.boolean = true;
+        }
+        else if (AGTE_IS_BOOL_FALSE(entry))
+        {
+            key_value->type = AGTV_BOOL;
+            key_value->val.boolean = false;
+        }
+        else if (AGTE_IS_AGTYPE(entry))
+        {
+            /* Extended types need deserialization - use existing function */
+            ag_deserialize_extended_type(base_addr, offset, key_value);
+        }
+        else
+        {
+            /* Container types shouldn't be keys, but handle gracefully */
+            key_value->type = AGTV_BINARY;
+            key_value->val.binary.data =
+                (agtype_container *)(base_addr + INTALIGN(offset));
+            key_value->val.binary.len = get_agtype_length(container, 0) -
+                                        (INTALIGN(offset) - offset);
+        }
+    }
+
+    return true;
+}
+
+/*
  * Helper function for agtype_access_operator map access.
  * Note: This function expects that a map and a scalar key are being passed.
+ *
+ * Optimized to use stack-allocated key_value and zero-copy string extraction.
  */
 static agtype_value *execute_map_access_operator(agtype *map,
                                                  agtype_value *map_value,
                                                  agtype *key)
 {
-    agtype_value *key_value;
+    agtype_value key_value;  /* Stack allocated - no palloc */
     char *key_str;
     int key_len = 0;
 
-    /* get the key from the container */
-    key_value = get_ith_agtype_value_from_container(&key->root, 0);
+    /* Extract key with zero-copy (strings point into key container) */
+    if (!extract_key_value_shallow(key, &key_value))
+    {
+        return NULL;
+    }
 
-    switch (key_value->type)
+    switch (key_value.type)
     {
     case AGTV_NULL:
         return NULL;
@@ -3475,8 +3556,8 @@ static agtype_value *execute_map_access_operator(agtype *map,
                         errmsg("AGTV_BOOL is not a valid key type")));
         break;
     case AGTV_STRING:
-        key_str = key_value->val.string.val;
-        key_len = key_value->val.string.len;
+        key_str = key_value.val.string.val;
+        key_len = key_value.val.string.len;
         break;
     default:
         ereport(ERROR, (errmsg("unknown agtype scalar type")));
@@ -3525,36 +3606,38 @@ static agtype_value *execute_map_access_operator_internal(
 /*
  * Helper function for agtype_access_operator array access.
  * Note: This function expects that an array and a scalar int are being passed.
+ *
+ * Optimized to use stack-allocated index_value and zero-copy extraction.
  */
 static agtype_value *execute_array_access_operator(agtype *array,
                                                    agtype_value *array_value,
                                                    agtype *array_index)
 {
-    agtype_value *array_index_value = NULL;
+    agtype_value array_index_value;  /* Stack allocated - no palloc */
     agtype_value *result = NULL;
 
-    /* unpack the array index value */
-    array_index_value = get_ith_agtype_value_from_container(&array_index->root,
-                                                            0);
+    /* Extract index with zero-copy */
+    if (!extract_key_value_shallow(array_index, &array_index_value))
+    {
+        return NULL;
+    }
 
     /* if AGTV_NULL return NULL */
-    if (array_index_value->type == AGTV_NULL)
+    if (array_index_value.type == AGTV_NULL)
     {
-        pfree_agtype_value(array_index_value);
         return NULL;
     }
 
     /* index must be an integer */
-    if (array_index_value->type != AGTV_INTEGER)
+    if (array_index_value.type != AGTV_INTEGER)
     {
         ereport(ERROR,
                 (errmsg("array index must resolve to an integer value")));
     }
 
-    result =  execute_array_access_operator_internal(array, array_value,
-                                                     array_index_value->val.int_value);
+    result = execute_array_access_operator_internal(array, array_value,
+                                                    array_index_value.val.int_value);
 
-    pfree_agtype_value(array_index_value);
     return result;
 }
 
@@ -4154,18 +4237,48 @@ Datum agtype_access_operator(PG_FUNCTION_ARGS)
                      errmsg("binary container must be a VLE vpc")));
         }
     }
-    /* if it is a scalar, open it and pull out the value */
+    /*
+     * If it is a scalar (vertex/edge), try to use optimized direct
+     * properties access to avoid full vertex/edge deserialization.
+     */
     else if (AGT_ROOT_IS_SCALAR(container))
     {
-        container_value = get_ith_agtype_value_from_container(&container->root,
-                                                              0);
+        agtype_value props_value;
+        uint32 entity_type;
 
-        /* it must be either a vertex or an edge */
-        if (container_value->type != AGTV_EDGE &&
-            container_value->type != AGTV_VERTEX)
+        /*
+         * Try the optimized path: extract properties directly from binary
+         * without full vertex/edge deserialization.
+         */
+        entity_type = ag_get_entity_properties_binary(&container->root,
+                                                      &props_value);
+
+        if (entity_type == AGT_HEADER_VERTEX || entity_type == AGT_HEADER_EDGE)
         {
+            /*
+             * Success! We got the properties as AGTV_BINARY without
+             * deserializing the entire vertex/edge.
+             */
+            container_value = palloc(sizeof(agtype_value));
+            *container_value = props_value;
+            /* Skip the vertex/edge type check below - go straight to map access */
+        }
+        else
+        {
+            /*
+             * Fallback: use original path with full deserialization.
+             * This handles non-standard structures or errors.
+             */
+            container_value = get_ith_agtype_value_from_container(&container->root,
+                                                                  0);
+
+            /* it must be either a vertex or an edge */
+            if (container_value->type != AGTV_EDGE &&
+                container_value->type != AGTV_VERTEX)
+            {
                 ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                                errmsg("scalar object must be a vertex or edge")));
+            }
         }
 
         /* clear the container reference */
