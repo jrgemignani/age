@@ -1,0 +1,1747 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * cypher_order_by_optimize.sql
+ *
+ * Regression tests for ORDER BY optimization on vertices and edges.
+ * The optimizer should replace _agtype_build_vertex/edge with raw graphid (p.id)
+ * in sort keys for more efficient sorting using native graphid comparison.
+ *
+ * Each test verifies that the Sort Key in EXPLAIN output uses the raw graphid
+ * instead of the full _agtype_build_vertex/edge expression.
+ */
+LOAD 'age';
+SET search_path TO ag_catalog;
+SELECT create_graph('order_by_opt');
+NOTICE:  graph "order_by_opt" has been created
+ create_graph 
+--------------
+ 
+(1 row)
+
+--
+-- Create test data: chain of people connected by 'knows' edges
+-- A -> B -> C -> D -> E -> F -> G -> H
+--
+SELECT * FROM cypher('order_by_opt', $$
+    CREATE (a:Person {name: 'A'})
+    CREATE (b:Person {name: 'B'})
+    CREATE (c:Person {name: 'C'})
+    CREATE (d:Person {name: 'D'})
+    CREATE (e:Person {name: 'E'})
+    CREATE (f:Person {name: 'F'})
+    CREATE (g:Person {name: 'G'})
+    CREATE (h:Person {name: 'H'})
+    CREATE (a)-[:knows]->(b)
+    CREATE (b)-[:knows]->(c)
+    CREATE (c)-[:knows]->(d)
+    CREATE (d)-[:knows]->(e)
+    CREATE (e)-[:knows]->(f)
+    CREATE (f)-[:knows]->(g)
+    CREATE (g)-[:knows]->(h)
+$$) AS (result agtype);
+ result 
+--------
+(0 rows)
+
+--
+-- Test 1: Simple MATCH with ORDER BY vertex
+-- Sort Key should use raw graphid (p.id)
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (p:Person)
+    RETURN p
+    ORDER BY p
+$$) AS (person agtype);
+                                     person                                      
+---------------------------------------------------------------------------------
+ {"id": 844424930131969, "label": "Person", "properties": {"name": "A"}}::vertex
+ {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex
+ {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex
+ {"id": 844424930131972, "label": "Person", "properties": {"name": "D"}}::vertex
+ {"id": 844424930131973, "label": "Person", "properties": {"name": "E"}}::vertex
+ {"id": 844424930131974, "label": "Person", "properties": {"name": "F"}}::vertex
+ {"id": 844424930131975, "label": "Person", "properties": {"name": "G"}}::vertex
+ {"id": 844424930131976, "label": "Person", "properties": {"name": "H"}}::vertex
+(8 rows)
+
+-- Verify optimization: Sort Key should show p.id (raw graphid)
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (p:Person)
+    RETURN p
+    ORDER BY p
+$$) AS (plan agtype);
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.p
+   ->  Index Scan using "Person_pkey" on order_by_opt."Person" p
+         Output: _agtype_build_vertex(p.id, _label_name('23460'::oid, p.id), p.properties), p.id
+(4 rows)
+
+--
+-- Test 2: Two-MATCH pattern with ORDER BY first vertex
+-- Sort Key should use raw graphid (a.id) through 2-level chain
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    RETURN a.name
+    ORDER BY a
+$$) AS (name agtype);
+ name 
+------
+ "A"
+ "B"
+ "C"
+ "D"
+ "E"
+ "F"
+(6 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                QUERY PLAN                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Inner Unique: true
+               Hash Cond: (_age_default_alias_1.end_id = c.id)
+               ->  Merge Join
+                     Output: a.id, a.properties, _age_default_alias_1.end_id
+                     Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                     ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                           Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                     ->  Sort
+                           Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                 ->  Hash Join
+                                       Output: a.id, a.properties, _age_default_alias_0.end_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                             Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                       ->  Hash
+                                             Output: a.id, a.properties
+                                             ->  Seq Scan on order_by_opt."Person" a
+                                                   Output: a.id, a.properties
+                                 ->  Hash
+                                       Output: b.id, b.properties
+                                       ->  Seq Scan on order_by_opt."Person" b
+                                             Output: b.id, b.properties
+               ->  Hash
+                     Output: c.id
+                     ->  Seq Scan on order_by_opt."Person" c
+                           Output: c.id
+(39 rows)
+
+--
+-- Test 3: Three-MATCH pattern with ORDER BY first vertex
+-- Sort Key should use raw graphid (a.id) through 3-level chain
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    RETURN a.name
+    ORDER BY a
+$$) AS (name agtype);
+ name 
+------
+ "A"
+ "B"
+ "C"
+ "D"
+ "E"
+(5 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                QUERY PLAN                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Hash Cond: (_age_default_alias_1.end_id = c.id)
+               ->  Merge Join
+                     Output: a.id, a.properties, _age_default_alias_1.end_id
+                     Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                     ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                           Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                     ->  Sort
+                           Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                 ->  Hash Join
+                                       Output: a.id, a.properties, _age_default_alias_0.end_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                             Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                       ->  Hash
+                                             Output: a.id, a.properties
+                                             ->  Seq Scan on order_by_opt."Person" a
+                                                   Output: a.id, a.properties
+                                 ->  Hash
+                                       Output: b.id, b.properties
+                                       ->  Seq Scan on order_by_opt."Person" b
+                                             Output: b.id, b.properties
+               ->  Hash
+                     Output: c.id
+                     ->  Merge Join
+                           Output: c.id
+                           Merge Cond: (_age_default_alias_2.start_id = ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid))
+                           ->  Sort
+                                 Output: _age_default_alias_2.start_id
+                                 Sort Key: _age_default_alias_2.start_id
+                                 ->  Hash Join
+                                       Output: _age_default_alias_2.start_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_2.end_id = d.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                             Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                       ->  Hash
+                                             Output: d.id
+                                             ->  Seq Scan on order_by_opt."Person" d
+                                                   Output: d.id
+                           ->  Sort
+                                 Output: c.id, c.properties, ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                 Sort Key: ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                 ->  Seq Scan on order_by_opt."Person" c
+                                       Output: c.id, c.properties, age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties))
+(57 rows)
+
+--
+-- Test 4: ORDER BY on edge
+-- Sort Key should use raw graphid (r.id)
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    RETURN r
+    ORDER BY r
+$$) AS (rel agtype);
+                                                            rel                                                             
+----------------------------------------------------------------------------------------------------------------------------
+ {"id": 1125899906842625, "label": "knows", "end_id": 844424930131970, "start_id": 844424930131969, "properties": {}}::edge
+ {"id": 1125899906842626, "label": "knows", "end_id": 844424930131971, "start_id": 844424930131970, "properties": {}}::edge
+ {"id": 1125899906842627, "label": "knows", "end_id": 844424930131972, "start_id": 844424930131971, "properties": {}}::edge
+ {"id": 1125899906842628, "label": "knows", "end_id": 844424930131973, "start_id": 844424930131972, "properties": {}}::edge
+ {"id": 1125899906842629, "label": "knows", "end_id": 844424930131974, "start_id": 844424930131973, "properties": {}}::edge
+ {"id": 1125899906842630, "label": "knows", "end_id": 844424930131975, "start_id": 844424930131974, "properties": {}}::edge
+ {"id": 1125899906842631, "label": "knows", "end_id": 844424930131976, "start_id": 844424930131975, "properties": {}}::edge
+(7 rows)
+
+-- Verify optimization for edge
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    RETURN r
+    ORDER BY r
+$$) AS (plan agtype);
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.r
+   ->  Sort
+         Output: (_agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties)), r.id
+         Sort Key: r.id
+         ->  Hash Join
+               Output: _agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties), r.id
+               Inner Unique: true
+               Hash Cond: (r.end_id = b.id)
+               ->  Hash Join
+                     Output: r.id, r.start_id, r.end_id, r.properties
+                     Inner Unique: true
+                     Hash Cond: (r.start_id = a.id)
+                     ->  Seq Scan on order_by_opt.knows r
+                           Output: r.id, r.start_id, r.end_id, r.properties
+                     ->  Hash
+                           Output: a.id
+                           ->  Seq Scan on order_by_opt."Person" a
+                                 Output: a.id
+               ->  Hash
+                     Output: b.id
+                     ->  Seq Scan on order_by_opt."Person" b
+                           Output: b.id
+(23 rows)
+
+--
+-- Test 5: ORDER BY DESC on vertex
+-- Sort Key should preserve DESC direction
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (p:Person)
+    RETURN p
+    ORDER BY p DESC
+$$) AS (person agtype);
+                                     person                                      
+---------------------------------------------------------------------------------
+ {"id": 844424930131976, "label": "Person", "properties": {"name": "H"}}::vertex
+ {"id": 844424930131975, "label": "Person", "properties": {"name": "G"}}::vertex
+ {"id": 844424930131974, "label": "Person", "properties": {"name": "F"}}::vertex
+ {"id": 844424930131973, "label": "Person", "properties": {"name": "E"}}::vertex
+ {"id": 844424930131972, "label": "Person", "properties": {"name": "D"}}::vertex
+ {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex
+ {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex
+ {"id": 844424930131969, "label": "Person", "properties": {"name": "A"}}::vertex
+(8 rows)
+
+-- Verify optimization preserves DESC
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (p:Person)
+    RETURN p
+    ORDER BY p DESC
+$$) AS (plan agtype);
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.p
+   ->  Index Scan Backward using "Person_pkey" on order_by_opt."Person" p
+         Output: _agtype_build_vertex(p.id, _label_name('23460'::oid, p.id), p.properties), p.id
+(4 rows)
+
+--
+-- Test 6: Multiple ORDER BY columns (property and vertex)
+-- Property sort key unchanged, vertex sort key optimized
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (p:Person)
+    RETURN p, p.name
+    ORDER BY p.name, p
+$$) AS (person agtype, name agtype);
+                                     person                                      | name 
+---------------------------------------------------------------------------------+------
+ {"id": 844424930131969, "label": "Person", "properties": {"name": "A"}}::vertex | "A"
+ {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex | "B"
+ {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex | "C"
+ {"id": 844424930131972, "label": "Person", "properties": {"name": "D"}}::vertex | "D"
+ {"id": 844424930131973, "label": "Person", "properties": {"name": "E"}}::vertex | "E"
+ {"id": 844424930131974, "label": "Person", "properties": {"name": "F"}}::vertex | "F"
+ {"id": 844424930131975, "label": "Person", "properties": {"name": "G"}}::vertex | "G"
+ {"id": 844424930131976, "label": "Person", "properties": {"name": "H"}}::vertex | "H"
+(8 rows)
+
+-- Verify second sort key is optimized
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (p:Person)
+    RETURN p, p.name
+    ORDER BY p.name, p
+$$) AS (plan agtype);
+ERROR:  return row and column definition list do not match
+LINE 1: SELECT * FROM cypher('order_by_opt', $$
+                      ^
+--
+-- Test 7: OPTIONAL MATCH with ORDER BY
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)
+    OPTIONAL MATCH (a)-[:knows]->(b:Person)
+    RETURN a, b
+    ORDER BY a
+    LIMIT 5
+$$) AS (a agtype, b agtype);
+                                        a                                        |                                        b                                        
+---------------------------------------------------------------------------------+---------------------------------------------------------------------------------
+ {"id": 844424930131969, "label": "Person", "properties": {"name": "A"}}::vertex | {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex
+ {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex | {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex
+ {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex | {"id": 844424930131972, "label": "Person", "properties": {"name": "D"}}::vertex
+ {"id": 844424930131972, "label": "Person", "properties": {"name": "D"}}::vertex | {"id": 844424930131973, "label": "Person", "properties": {"name": "E"}}::vertex
+ {"id": 844424930131973, "label": "Person", "properties": {"name": "E"}}::vertex | {"id": 844424930131974, "label": "Person", "properties": {"name": "F"}}::vertex
+(5 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)
+    OPTIONAL MATCH (a)-[:knows]->(b:Person)
+    RETURN a, b
+    ORDER BY a
+    LIMIT 5
+$$) AS (plan agtype);
+ERROR:  return row and column definition list do not match
+LINE 1: SELECT * FROM cypher('order_by_opt', $$
+                      ^
+--
+-- Test 8: WITH clause and ORDER BY
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (p:Person)
+    WITH p
+    WHERE p.name IN ['A', 'B', 'C']
+    RETURN p
+    ORDER BY p
+$$) AS (person agtype);
+                                     person                                      
+---------------------------------------------------------------------------------
+ {"id": 844424930131969, "label": "Person", "properties": {"name": "A"}}::vertex
+ {"id": 844424930131970, "label": "Person", "properties": {"name": "B"}}::vertex
+ {"id": 844424930131971, "label": "Person", "properties": {"name": "C"}}::vertex
+(3 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (p:Person)
+    WITH p
+    WHERE p.name IN ['A', 'B', 'C']
+    RETURN p
+    ORDER BY p
+$$) AS (plan agtype);
+                                                                                                QUERY PLAN                                                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.p
+   ->  Sort
+         Output: (_agtype_build_vertex(p.id, _label_name('23460'::oid, p.id), p.properties)), p.id
+         Sort Key: p.id
+         ->  Seq Scan on order_by_opt."Person" p
+               Output: _agtype_build_vertex(p.id, _label_name('23460'::oid, p.id), p.properties), p.id
+               Filter: (agtype_access_operator(VARIADIC ARRAY[_agtype_build_vertex(p.id, _label_name('23460'::oid, p.id), p.properties), '"name"'::agtype]) = ANY ('{"\"A\"","\"B\"","\"C\""}'::agtype[]))
+(8 rows)
+
+--
+-- Test 9: Path length 3 - MATCH (a)-[]->(b)-[]->(c)-[]->(d)
+-- ORDER BY on first vertex through 1 MATCH
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)-[:knows]->(d:Person)
+    RETURN a.name, b.name, c.name, d.name
+    ORDER BY a
+$$) AS (a agtype, b agtype, c agtype, d agtype);
+  a  |  b  |  c  |  d  
+-----+-----+-----+-----
+ "A" | "B" | "C" | "D"
+ "B" | "C" | "D" | "E"
+ "C" | "D" | "E" | "F"
+ "D" | "E" | "F" | "G"
+ "E" | "F" | "G" | "H"
+(5 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)-[:knows]->(d:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                             QUERY PLAN                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Hash Cond: (_age_default_alias_1.end_id = c.id)
+               Join Filter: _ag_enforce_edge_uniqueness3(_age_default_alias_0.id, _age_default_alias_1.id, _age_default_alias_2.id)
+               ->  Hash Join
+                     Output: a.id, a.properties, _age_default_alias_0.id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                     Hash Cond: (_age_default_alias_0.end_id = b.id)
+                     ->  Hash Join
+                           Output: a.id, a.properties, _age_default_alias_0.end_id, _age_default_alias_0.id
+                           Inner Unique: true
+                           Hash Cond: (_age_default_alias_0.start_id = a.id)
+                           ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                 Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                           ->  Hash
+                                 Output: a.id, a.properties
+                                 ->  Seq Scan on order_by_opt."Person" a
+                                       Output: a.id, a.properties
+                     ->  Hash
+                           Output: b.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                           ->  Hash Join
+                                 Output: b.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_1.start_id = b.id)
+                                 ->  Seq Scan on order_by_opt.knows _age_default_alias_1
+                                       Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                 ->  Hash
+                                       Output: b.id
+                                       ->  Seq Scan on order_by_opt."Person" b
+                                             Output: b.id
+               ->  Hash
+                     Output: c.id, _age_default_alias_2.start_id, _age_default_alias_2.id
+                     ->  Hash Join
+                           Output: c.id, _age_default_alias_2.start_id, _age_default_alias_2.id
+                           Inner Unique: true
+                           Hash Cond: (_age_default_alias_2.end_id = d.id)
+                           ->  Hash Join
+                                 Output: c.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.id
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_2.start_id = c.id)
+                                 ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                       Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                 ->  Hash
+                                       Output: c.id
+                                       ->  Seq Scan on order_by_opt."Person" c
+                                             Output: c.id
+                           ->  Hash
+                                 Output: d.id
+                                 ->  Seq Scan on order_by_opt."Person" d
+                                       Output: d.id
+(54 rows)
+
+--
+-- Test 10: Path length 5 - 5 hops in single MATCH
+-- ORDER BY on first vertex
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+          -[:knows]->(d:Person)-[:knows]->(e:Person)-[:knows]->(f:Person)
+    RETURN a.name, f.name
+    ORDER BY a
+$$) AS (a agtype, f agtype);
+  a  |  f  
+-----+-----
+ "A" | "F"
+ "B" | "G"
+ "C" | "H"
+(3 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+          -[:knows]->(d:Person)-[:knows]->(e:Person)-[:knows]->(f:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                        QUERY PLAN                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Merge Join
+         Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+         Inner Unique: true
+         Merge Cond: (_age_default_alias_0.start_id = a.id)
+         ->  Sort
+               Output: _age_default_alias_0.start_id
+               Sort Key: _age_default_alias_0.start_id
+               ->  Hash Join
+                     Output: _age_default_alias_0.start_id
+                     Hash Cond: (_age_default_alias_2.end_id = d.id)
+                     Join Filter: _ag_enforce_edge_uniqueness(_age_default_alias_0.id, _age_default_alias_1.id, _age_default_alias_2.id, _age_default_alias_3.id, _age_default_alias_4.id)
+                     ->  Hash Join
+                           Output: _age_default_alias_0.start_id, _age_default_alias_0.id, _age_default_alias_1.id, _age_default_alias_2.end_id, _age_default_alias_2.id
+                           Hash Cond: (_age_default_alias_1.end_id = c.id)
+                           ->  Hash Join
+                                 Output: _age_default_alias_0.start_id, _age_default_alias_0.id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                 Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                 ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                       Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                 ->  Hash
+                                       Output: b.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                       ->  Hash Join
+                                             Output: b.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                             Inner Unique: true
+                                             Hash Cond: (_age_default_alias_1.start_id = b.id)
+                                             ->  Seq Scan on order_by_opt.knows _age_default_alias_1
+                                                   Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                             ->  Hash
+                                                   Output: b.id
+                                                   ->  Seq Scan on order_by_opt."Person" b
+                                                         Output: b.id
+                           ->  Hash
+                                 Output: c.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.id
+                                 ->  Hash Join
+                                       Output: c.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_2.start_id = c.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                             Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                       ->  Hash
+                                             Output: c.id
+                                             ->  Seq Scan on order_by_opt."Person" c
+                                                   Output: c.id
+                     ->  Hash
+                           Output: d.id, _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.id
+                           ->  Hash Join
+                                 Output: d.id, _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.id
+                                 Hash Cond: (_age_default_alias_3.end_id = e.id)
+                                 ->  Hash Join
+                                       Output: d.id, _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_3.start_id = d.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_3
+                                             Output: _age_default_alias_3.id, _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.properties
+                                       ->  Hash
+                                             Output: d.id
+                                             ->  Seq Scan on order_by_opt."Person" d
+                                                   Output: d.id
+                                 ->  Hash
+                                       Output: e.id, _age_default_alias_4.start_id, _age_default_alias_4.id
+                                       ->  Hash Join
+                                             Output: e.id, _age_default_alias_4.start_id, _age_default_alias_4.id
+                                             Inner Unique: true
+                                             Hash Cond: (_age_default_alias_4.end_id = f.id)
+                                             ->  Hash Join
+                                                   Output: e.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.id
+                                                   Inner Unique: true
+                                                   Hash Cond: (_age_default_alias_4.start_id = e.id)
+                                                   ->  Seq Scan on order_by_opt.knows _age_default_alias_4
+                                                         Output: _age_default_alias_4.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.properties
+                                                   ->  Hash
+                                                         Output: e.id
+                                                         ->  Seq Scan on order_by_opt."Person" e
+                                                               Output: e.id
+                                             ->  Hash
+                                                   Output: f.id
+                                                   ->  Seq Scan on order_by_opt."Person" f
+                                                         Output: f.id
+         ->  Sort
+               Output: a.id, a.properties
+               Sort Key: a.id
+               ->  Seq Scan on order_by_opt."Person" a
+                     Output: a.id, a.properties
+(85 rows)
+
+--
+-- Test 11: Path length 7 - 7 hops in single MATCH
+-- ORDER BY on first vertex
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+          -[:knows]->(d:Person)-[:knows]->(e:Person)-[:knows]->(f:Person)
+          -[:knows]->(g:Person)-[:knows]->(h:Person)
+    RETURN a.name, h.name
+    ORDER BY a
+$$) AS (a agtype, h agtype);
+  a  |  h  
+-----+-----
+ "A" | "H"
+(1 row)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+          -[:knows]->(d:Person)-[:knows]->(e:Person)-[:knows]->(f:Person)
+          -[:knows]->(g:Person)-[:knows]->(h:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                                                                                            QUERY PLAN                                                                                                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Inner Unique: true
+               Hash Cond: (_age_default_alias_6.end_id = h.id)
+               ->  Hash Join
+                     Output: a.id, a.properties, _age_default_alias_6.end_id
+                     Inner Unique: true
+                     Hash Cond: (_age_default_alias_4.end_id = f.id)
+                     ->  Nested Loop
+                           Output: a.id, a.properties, _age_default_alias_4.end_id, _age_default_alias_5.start_id, _age_default_alias_6.end_id
+                           Join Filter: (_ag_enforce_edge_uniqueness(_age_default_alias_0.id, _age_default_alias_1.id, _age_default_alias_2.id, _age_default_alias_3.id, _age_default_alias_4.id, _age_default_alias_5.id, _age_default_alias_6.id) AND (_age_default_alias_5.end_id = _age_default_alias_6.start_id))
+                           ->  Hash Join
+                                 Output: a.id, a.properties, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.id, g.id, _age_default_alias_0.id
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                 ->  Hash Join
+                                       Output: _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.id, g.id, _age_default_alias_0.start_id, _age_default_alias_0.id
+                                       Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                             Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                       ->  Hash
+                                             Output: b.id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.start_id, _age_default_alias_1.id, g.id
+                                             ->  Hash Join
+                                                   Output: b.id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.start_id, _age_default_alias_1.id, g.id
+                                                   Inner Unique: true
+                                                   Hash Cond: (_age_default_alias_5.end_id = g.id)
+                                                   ->  Hash Join
+                                                         Output: b.id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.start_id, _age_default_alias_1.id
+                                                         Inner Unique: true
+                                                         Hash Cond: (_age_default_alias_1.start_id = b.id)
+                                                         ->  Hash Join
+                                                               Output: _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.id, _age_default_alias_1.start_id, _age_default_alias_1.id
+                                                               Hash Cond: (_age_default_alias_1.end_id = c.id)
+                                                               ->  Seq Scan on order_by_opt.knows _age_default_alias_1
+                                                                     Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                                               ->  Hash
+                                                                     Output: c.id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.start_id, _age_default_alias_2.id
+                                                                     ->  Hash Join
+                                                                           Output: c.id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.start_id, _age_default_alias_2.id
+                                                                           Inner Unique: true
+                                                                           Hash Cond: (_age_default_alias_2.start_id = c.id)
+                                                                           ->  Hash Join
+                                                                                 Output: _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id, _age_default_alias_2.start_id, _age_default_alias_2.id
+                                                                                 Hash Cond: (_age_default_alias_2.end_id = d.id)
+                                                                                 ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                                                                       Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                                                                 ->  Hash
+                                                                                       Output: _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, d.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id
+                                                                                       ->  Merge Join
+                                                                                             Output: _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, d.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.id
+                                                                                             Merge Cond: (_age_default_alias_5.start_id = _age_default_alias_4.end_id)
+                                                                                             ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_5
+                                                                                                   Output: _age_default_alias_5.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.properties
+                                                                                             ->  Sort
+                                                                                                   Output: _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, d.id
+                                                                                                   Sort Key: _age_default_alias_4.end_id
+                                                                                                   ->  Hash Join
+                                                                                                         Output: _age_default_alias_3.start_id, _age_default_alias_3.id, _age_default_alias_4.end_id, _age_default_alias_4.id, d.id
+                                                                                                         Inner Unique: true
+                                                                                                         Hash Cond: (_age_default_alias_3.end_id = e.id)
+                                                                                                         ->  Hash Join
+                                                                                                               Output: _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.id, d.id
+                                                                                                               Inner Unique: true
+                                                                                                               Hash Cond: (_age_default_alias_3.start_id = d.id)
+                                                                                                               ->  Merge Join
+                                                                                                                     Output: _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.id
+                                                                                                                     Merge Cond: (_age_default_alias_3.end_id = _age_default_alias_4.start_id)
+                                                                                                                     ->  Index Scan using knows_end_id_idx on order_by_opt.knows _age_default_alias_3
+                                                                                                                           Output: _age_default_alias_3.id, _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.properties
+                                                                                                                     ->  Materialize
+                                                                                                                           Output: _age_default_alias_4.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.properties
+                                                                                                                           ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_4
+                                                                                                                                 Output: _age_default_alias_4.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.properties
+                                                                                                               ->  Hash
+                                                                                                                     Output: d.id
+                                                                                                                     ->  Seq Scan on order_by_opt."Person" d
+                                                                                                                           Output: d.id
+                                                                                                         ->  Hash
+                                                                                                               Output: e.id
+                                                                                                               ->  Seq Scan on order_by_opt."Person" e
+                                                                                                                     Output: e.id
+                                                                           ->  Hash
+                                                                                 Output: c.id
+                                                                                 ->  Seq Scan on order_by_opt."Person" c
+                                                                                       Output: c.id
+                                                         ->  Hash
+                                                               Output: b.id
+                                                               ->  Seq Scan on order_by_opt."Person" b
+                                                                     Output: b.id
+                                                   ->  Hash
+                                                         Output: g.id
+                                                         ->  Seq Scan on order_by_opt."Person" g
+                                                               Output: g.id
+                                 ->  Hash
+                                       Output: a.id, a.properties
+                                       ->  Seq Scan on order_by_opt."Person" a
+                                             Output: a.id, a.properties
+                           ->  Memoize
+                                 Output: _age_default_alias_6.start_id, _age_default_alias_6.end_id, _age_default_alias_6.id
+                                 Cache Key: g.id
+                                 Cache Mode: logical
+                                 ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_6
+                                       Output: _age_default_alias_6.start_id, _age_default_alias_6.end_id, _age_default_alias_6.id
+                                       Index Cond: (_age_default_alias_6.start_id = g.id)
+                     ->  Hash
+                           Output: f.id
+                           ->  Seq Scan on order_by_opt."Person" f
+                                 Output: f.id
+               ->  Hash
+                     Output: h.id
+                     ->  Seq Scan on order_by_opt."Person" h
+                           Output: h.id
+(117 rows)
+
+--
+-- Test 12: Path length 3 with multiple MATCHes
+-- 3 separate MATCH clauses
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    RETURN a.name, d.name
+    ORDER BY a
+$$) AS (a agtype, d agtype);
+  a  |  d  
+-----+-----
+ "A" | "D"
+ "B" | "E"
+ "C" | "F"
+ "D" | "G"
+ "E" | "H"
+(5 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                QUERY PLAN                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Hash Cond: (_age_default_alias_1.end_id = c.id)
+               ->  Merge Join
+                     Output: a.id, a.properties, _age_default_alias_1.end_id
+                     Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                     ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                           Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                     ->  Sort
+                           Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                 ->  Hash Join
+                                       Output: a.id, a.properties, _age_default_alias_0.end_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                             Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                       ->  Hash
+                                             Output: a.id, a.properties
+                                             ->  Seq Scan on order_by_opt."Person" a
+                                                   Output: a.id, a.properties
+                                 ->  Hash
+                                       Output: b.id, b.properties
+                                       ->  Seq Scan on order_by_opt."Person" b
+                                             Output: b.id, b.properties
+               ->  Hash
+                     Output: c.id
+                     ->  Merge Join
+                           Output: c.id
+                           Merge Cond: (_age_default_alias_2.start_id = ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid))
+                           ->  Sort
+                                 Output: _age_default_alias_2.start_id
+                                 Sort Key: _age_default_alias_2.start_id
+                                 ->  Hash Join
+                                       Output: _age_default_alias_2.start_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_2.end_id = d.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                             Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                       ->  Hash
+                                             Output: d.id
+                                             ->  Seq Scan on order_by_opt."Person" d
+                                                   Output: d.id
+                           ->  Sort
+                                 Output: c.id, c.properties, ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                 Sort Key: ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                 ->  Seq Scan on order_by_opt."Person" c
+                                       Output: c.id, c.properties, age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties))
+(57 rows)
+
+--
+-- Test 13: Path length 5 with multiple MATCHes
+-- 5 separate MATCH clauses
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    MATCH (d)-[:knows]->(e:Person)
+    MATCH (e)-[:knows]->(f:Person)
+    RETURN a.name, f.name
+    ORDER BY a
+$$) AS (a agtype, f agtype);
+  a  |  f  
+-----+-----
+ "A" | "F"
+ "B" | "G"
+ "C" | "H"
+(3 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    MATCH (d)-[:knows]->(e:Person)
+    MATCH (e)-[:knows]->(f:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Hash Cond: (_age_default_alias_3.end_id = e.id)
+               ->  Merge Join
+                     Output: a.id, a.properties, _age_default_alias_3.end_id
+                     Merge Cond: (_age_default_alias_3.start_id = ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid))
+                     ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_3
+                           Output: _age_default_alias_3.id, _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.properties
+                     ->  Sort
+                           Output: a.id, a.properties, d.id, d.properties, ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, d.id, d.properties, age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties))
+                                 Hash Cond: (_age_default_alias_1.end_id = c.id)
+                                 ->  Merge Join
+                                       Output: a.id, a.properties, _age_default_alias_1.end_id
+                                       Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                                       ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                                             Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                       ->  Sort
+                                             Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                                             Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                                             ->  Hash Join
+                                                   Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                                   Inner Unique: true
+                                                   Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                                   ->  Hash Join
+                                                         Output: a.id, a.properties, _age_default_alias_0.end_id
+                                                         Inner Unique: true
+                                                         Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                                         ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                                               Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                                         ->  Hash
+                                                               Output: a.id, a.properties
+                                                               ->  Seq Scan on order_by_opt."Person" a
+                                                                     Output: a.id, a.properties
+                                                   ->  Hash
+                                                         Output: b.id, b.properties
+                                                         ->  Seq Scan on order_by_opt."Person" b
+                                                               Output: b.id, b.properties
+                                 ->  Hash
+                                       Output: c.id, d.id, d.properties
+                                       ->  Merge Join
+                                             Output: c.id, d.id, d.properties
+                                             Merge Cond: (_age_default_alias_2.start_id = ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid))
+                                             ->  Sort
+                                                   Output: _age_default_alias_2.start_id, d.id, d.properties
+                                                   Sort Key: _age_default_alias_2.start_id
+                                                   ->  Hash Join
+                                                         Output: _age_default_alias_2.start_id, d.id, d.properties
+                                                         Inner Unique: true
+                                                         Hash Cond: (_age_default_alias_2.end_id = d.id)
+                                                         ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                                               Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                                         ->  Hash
+                                                               Output: d.id, d.properties
+                                                               ->  Seq Scan on order_by_opt."Person" d
+                                                                     Output: d.id, d.properties
+                                             ->  Sort
+                                                   Output: c.id, c.properties, ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                                   Sort Key: ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                                   ->  Seq Scan on order_by_opt."Person" c
+                                                         Output: c.id, c.properties, age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties))
+               ->  Hash
+                     Output: e.id
+                     ->  Merge Join
+                           Output: e.id
+                           Merge Cond: (_age_default_alias_4.start_id = ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid))
+                           ->  Sort
+                                 Output: _age_default_alias_4.start_id
+                                 Sort Key: _age_default_alias_4.start_id
+                                 ->  Hash Join
+                                       Output: _age_default_alias_4.start_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_4.end_id = f.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_4
+                                             Output: _age_default_alias_4.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.properties
+                                       ->  Hash
+                                             Output: f.id
+                                             ->  Seq Scan on order_by_opt."Person" f
+                                                   Output: f.id
+                           ->  Sort
+                                 Output: e.id, e.properties, ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid)
+                                 Sort Key: ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid)
+                                 ->  Seq Scan on order_by_opt."Person" e
+                                       Output: e.id, e.properties, age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties))
+(91 rows)
+
+--
+-- Test 14: Path length 7 with multiple MATCHes
+-- 7 separate MATCH clauses
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    MATCH (d)-[:knows]->(e:Person)
+    MATCH (e)-[:knows]->(f:Person)
+    MATCH (f)-[:knows]->(g:Person)
+    MATCH (g)-[:knows]->(h:Person)
+    RETURN a.name, h.name
+    ORDER BY a
+$$) AS (a agtype, h agtype);
+  a  |  h  
+-----+-----
+ "A" | "H"
+(1 row)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    MATCH (c)-[:knows]->(d:Person)
+    MATCH (d)-[:knows]->(e:Person)
+    MATCH (e)-[:knows]->(f:Person)
+    MATCH (f)-[:knows]->(g:Person)
+    MATCH (g)-[:knows]->(h:Person)
+    RETURN a
+    ORDER BY a
+$$) AS (plan agtype);
+                                                                                                  QUERY PLAN                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _
+   Output: _.a
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), a.id
+         Sort Key: a.id
+         ->  Merge Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), a.id
+               Merge Cond: (_age_default_alias_6.start_id = ((age_id(_agtype_build_vertex(g.id, _label_name('23460'::oid, g.id), g.properties)))::graphid))
+               ->  Sort
+                     Output: _age_default_alias_6.start_id
+                     Sort Key: _age_default_alias_6.start_id
+                     ->  Hash Join
+                           Output: _age_default_alias_6.start_id
+                           Inner Unique: true
+                           Hash Cond: (_age_default_alias_6.end_id = h.id)
+                           ->  Seq Scan on order_by_opt.knows _age_default_alias_6
+                                 Output: _age_default_alias_6.id, _age_default_alias_6.start_id, _age_default_alias_6.end_id, _age_default_alias_6.properties
+                           ->  Hash
+                                 Output: h.id
+                                 ->  Seq Scan on order_by_opt."Person" h
+                                       Output: h.id
+               ->  Materialize
+                     Output: a.id, a.properties, g.id, g.properties, ((age_id(_agtype_build_vertex(g.id, _label_name('23460'::oid, g.id), g.properties)))::graphid)
+                     ->  Sort
+                           Output: a.id, a.properties, g.id, g.properties, ((age_id(_agtype_build_vertex(g.id, _label_name('23460'::oid, g.id), g.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(g.id, _label_name('23460'::oid, g.id), g.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, g.id, g.properties, age_id(_agtype_build_vertex(g.id, _label_name('23460'::oid, g.id), g.properties))
+                                 Hash Cond: (_age_default_alias_3.end_id = e.id)
+                                 ->  Merge Join
+                                       Output: a.id, a.properties, _age_default_alias_3.end_id
+                                       Merge Cond: (_age_default_alias_3.start_id = ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid))
+                                       ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_3
+                                             Output: _age_default_alias_3.id, _age_default_alias_3.start_id, _age_default_alias_3.end_id, _age_default_alias_3.properties
+                                       ->  Sort
+                                             Output: a.id, a.properties, d.id, d.properties, ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid)
+                                             Sort Key: ((age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties)))::graphid)
+                                             ->  Hash Join
+                                                   Output: a.id, a.properties, d.id, d.properties, age_id(_agtype_build_vertex(d.id, _label_name('23460'::oid, d.id), d.properties))
+                                                   Hash Cond: (_age_default_alias_1.end_id = c.id)
+                                                   ->  Merge Join
+                                                         Output: a.id, a.properties, _age_default_alias_1.end_id
+                                                         Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                                                         ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                                                               Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                                         ->  Sort
+                                                               Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                                                               Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                                                               ->  Hash Join
+                                                                     Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                                                     Inner Unique: true
+                                                                     Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                                                     ->  Hash Join
+                                                                           Output: a.id, a.properties, _age_default_alias_0.end_id
+                                                                           Inner Unique: true
+                                                                           Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                                                           ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                                                                 Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                                                           ->  Hash
+                                                                                 Output: a.id, a.properties
+                                                                                 ->  Seq Scan on order_by_opt."Person" a
+                                                                                       Output: a.id, a.properties
+                                                                     ->  Hash
+                                                                           Output: b.id, b.properties
+                                                                           ->  Seq Scan on order_by_opt."Person" b
+                                                                                 Output: b.id, b.properties
+                                                   ->  Hash
+                                                         Output: c.id, d.id, d.properties
+                                                         ->  Merge Join
+                                                               Output: c.id, d.id, d.properties
+                                                               Merge Cond: (_age_default_alias_2.start_id = ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid))
+                                                               ->  Sort
+                                                                     Output: _age_default_alias_2.start_id, d.id, d.properties
+                                                                     Sort Key: _age_default_alias_2.start_id
+                                                                     ->  Hash Join
+                                                                           Output: _age_default_alias_2.start_id, d.id, d.properties
+                                                                           Inner Unique: true
+                                                                           Hash Cond: (_age_default_alias_2.end_id = d.id)
+                                                                           ->  Seq Scan on order_by_opt.knows _age_default_alias_2
+                                                                                 Output: _age_default_alias_2.id, _age_default_alias_2.start_id, _age_default_alias_2.end_id, _age_default_alias_2.properties
+                                                                           ->  Hash
+                                                                                 Output: d.id, d.properties
+                                                                                 ->  Seq Scan on order_by_opt."Person" d
+                                                                                       Output: d.id, d.properties
+                                                               ->  Sort
+                                                                     Output: c.id, c.properties, ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                                                     Sort Key: ((age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)))::graphid)
+                                                                     ->  Seq Scan on order_by_opt."Person" c
+                                                                           Output: c.id, c.properties, age_id(_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties))
+                                 ->  Hash
+                                       Output: e.id, g.id, g.properties
+                                       ->  Hash Join
+                                             Output: e.id, g.id, g.properties
+                                             Hash Cond: (_age_default_alias_4.end_id = f.id)
+                                             ->  Merge Join
+                                                   Output: e.id, _age_default_alias_4.end_id
+                                                   Merge Cond: (_age_default_alias_4.start_id = ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid))
+                                                   ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_4
+                                                         Output: _age_default_alias_4.id, _age_default_alias_4.start_id, _age_default_alias_4.end_id, _age_default_alias_4.properties
+                                                   ->  Sort
+                                                         Output: e.id, e.properties, ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid)
+                                                         Sort Key: ((age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties)))::graphid)
+                                                         ->  Seq Scan on order_by_opt."Person" e
+                                                               Output: e.id, e.properties, age_id(_agtype_build_vertex(e.id, _label_name('23460'::oid, e.id), e.properties))
+                                             ->  Hash
+                                                   Output: f.id, g.id, g.properties
+                                                   ->  Merge Join
+                                                         Output: f.id, g.id, g.properties
+                                                         Merge Cond: (_age_default_alias_5.start_id = ((age_id(_agtype_build_vertex(f.id, _label_name('23460'::oid, f.id), f.properties)))::graphid))
+                                                         ->  Sort
+                                                               Output: _age_default_alias_5.start_id, g.id, g.properties
+                                                               Sort Key: _age_default_alias_5.start_id
+                                                               ->  Hash Join
+                                                                     Output: _age_default_alias_5.start_id, g.id, g.properties
+                                                                     Inner Unique: true
+                                                                     Hash Cond: (_age_default_alias_5.end_id = g.id)
+                                                                     ->  Seq Scan on order_by_opt.knows _age_default_alias_5
+                                                                           Output: _age_default_alias_5.id, _age_default_alias_5.start_id, _age_default_alias_5.end_id, _age_default_alias_5.properties
+                                                                     ->  Hash
+                                                                           Output: g.id, g.properties
+                                                                           ->  Seq Scan on order_by_opt."Person" g
+                                                                                 Output: g.id, g.properties
+                                                         ->  Sort
+                                                               Output: f.id, f.properties, ((age_id(_agtype_build_vertex(f.id, _label_name('23460'::oid, f.id), f.properties)))::graphid)
+                                                               Sort Key: ((age_id(_agtype_build_vertex(f.id, _label_name('23460'::oid, f.id), f.properties)))::graphid)
+                                                               ->  Seq Scan on order_by_opt."Person" f
+                                                                     Output: f.id, f.properties, age_id(_agtype_build_vertex(f.id, _label_name('23460'::oid, f.id), f.properties))
+(127 rows)
+
+--
+-- Test 15: WITH clause passing multiple variables with ORDER BY on multiple vertices
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a, b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+ "D"    | "E"
+ "E"    | "F"
+ "F"    | "G"
+ "G"    | "H"
+(7 rows)
+
+-- Verify optimization for multiple sort keys
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a, b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id, b.id
+         Sort Key: a.id, b.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), a.id, b.id
+               Inner Unique: true
+               Hash Cond: (_age_default_alias_0.end_id = b.id)
+               ->  Hash Join
+                     Output: a.id, a.properties, _age_default_alias_0.end_id
+                     Inner Unique: true
+                     Hash Cond: (_age_default_alias_0.start_id = a.id)
+                     ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                           Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                     ->  Hash
+                           Output: a.id, a.properties
+                           ->  Seq Scan on order_by_opt."Person" a
+                                 Output: a.id, a.properties
+               ->  Hash
+                     Output: b.id, b.properties
+                     ->  Seq Scan on order_by_opt."Person" b
+                           Output: b.id, b.properties
+(23 rows)
+
+--
+-- Test 16: WITH clause with ORDER BY on vertex and edge
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    WITH a, r, b
+    ORDER BY a, r
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+ "D"    | "E"
+ "E"    | "F"
+ "F"    | "G"
+ "G"    | "H"
+(7 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    WITH a, r, b
+    ORDER BY a, r
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                                                      QUERY PLAN                                                                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id, r.id
+         Sort Key: a.id, r.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), a.id, r.id
+               Inner Unique: true
+               Hash Cond: (r.end_id = b.id)
+               ->  Hash Join
+                     Output: a.id, a.properties, r.id, r.start_id, r.end_id, r.properties
+                     Inner Unique: true
+                     Hash Cond: (r.start_id = a.id)
+                     ->  Seq Scan on order_by_opt.knows r
+                           Output: r.id, r.start_id, r.end_id, r.properties
+                     ->  Hash
+                           Output: a.id, a.properties
+                           ->  Seq Scan on order_by_opt."Person" a
+                                 Output: a.id, a.properties
+               ->  Hash
+                     Output: b.id, b.properties
+                     ->  Seq Scan on order_by_opt."Person" b
+                           Output: b.id, b.properties
+(23 rows)
+
+--
+-- Test 17: Chained WITH clauses each with ORDER BY
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a
+    WITH a, b
+    ORDER BY b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+ "D"    | "E"
+ "E"    | "F"
+ "F"    | "G"
+ "G"    | "H"
+(7 rows)
+
+-- Verify optimization on chained ORDER BY
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a
+    WITH a, b
+    ORDER BY b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Sort
+         Output: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b
+         Sort Key: _age_default_alias_previous_cypher_clause_1.b
+         ->  Subquery Scan on _age_default_alias_previous_cypher_clause_1
+               Output: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b
+               ->  Sort
+                     Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id
+                     Sort Key: a.id
+                     ->  Hash Join
+                           Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), a.id
+                           Inner Unique: true
+                           Hash Cond: (_age_default_alias_0.end_id = b.id)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, _age_default_alias_0.end_id
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                 ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                       Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                 ->  Hash
+                                       Output: a.id, a.properties
+                                       ->  Seq Scan on order_by_opt."Person" a
+                                             Output: a.id, a.properties
+                           ->  Hash
+                                 Output: b.id, b.properties
+                                 ->  Seq Scan on order_by_opt."Person" b
+                                       Output: b.id, b.properties
+(28 rows)
+
+--
+-- Test 18: WITH clause with multiple ORDER BY columns (mixed directions)
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a ASC, b DESC
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+ "D"    | "E"
+ "E"    | "F"
+ "F"    | "G"
+ "G"    | "H"
+(7 rows)
+
+-- Verify optimization preserves sort directions
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a ASC, b DESC
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id, b.id
+         Sort Key: a.id, b.id DESC
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), a.id, b.id
+               Inner Unique: true
+               Hash Cond: (_age_default_alias_0.end_id = b.id)
+               ->  Hash Join
+                     Output: a.id, a.properties, _age_default_alias_0.end_id
+                     Inner Unique: true
+                     Hash Cond: (_age_default_alias_0.start_id = a.id)
+                     ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                           Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                     ->  Hash
+                           Output: a.id, a.properties
+                           ->  Seq Scan on order_by_opt."Person" a
+                                 Output: a.id, a.properties
+               ->  Hash
+                     Output: b.id, b.properties
+                     ->  Seq Scan on order_by_opt."Person" b
+                           Output: b.id, b.properties
+(23 rows)
+
+--
+-- Test 19: Three-level chain with ORDER BY at each WITH
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+    WITH a, b, c
+    ORDER BY a
+    WITH a, b, c
+    ORDER BY b
+    WITH a, b, c
+    ORDER BY c
+    RETURN a.name, b.name, c.name
+$$) AS (a_name agtype, b_name agtype, c_name agtype);
+ a_name | b_name | c_name 
+--------+--------+--------
+ "A"    | "B"    | "C"
+ "B"    | "C"    | "D"
+ "C"    | "D"    | "E"
+ "D"    | "E"    | "F"
+ "E"    | "F"    | "G"
+ "F"    | "G"    | "H"
+(6 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person)
+    WITH a, b, c
+    ORDER BY a
+    WITH a, b, c
+    ORDER BY b
+    WITH a, b, c
+    ORDER BY c
+    RETURN a.name, b.name, c.name
+$$) AS (a_name agtype, b_name agtype, c_name agtype);
+                                                                                                                                                          QUERY PLAN                                                                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.c, '"name"'::agtype])
+   ->  Sort
+         Output: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b, _age_default_alias_previous_cypher_clause_1.c
+         Sort Key: _age_default_alias_previous_cypher_clause_1.c
+         ->  Sort
+               Output: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b, _age_default_alias_previous_cypher_clause_1.c
+               Sort Key: _age_default_alias_previous_cypher_clause_1.b
+               ->  Subquery Scan on _age_default_alias_previous_cypher_clause_1
+                     Output: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b, _age_default_alias_previous_cypher_clause_1.c
+                     ->  Sort
+                           Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), (_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)), a.id
+                           Sort Key: a.id
+                           ->  Hash Join
+                                 Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), _agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties), a.id
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_1.end_id = c.id)
+                                 ->  Hash Join
+                                       Output: a.id, a.properties, b.id, b.properties, _age_default_alias_1.end_id
+                                       Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                       Join Filter: _ag_enforce_edge_uniqueness2(_age_default_alias_0.id, _age_default_alias_1.id)
+                                       ->  Hash Join
+                                             Output: a.id, a.properties, _age_default_alias_0.end_id, _age_default_alias_0.id
+                                             Inner Unique: true
+                                             Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                             ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                                   Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                             ->  Hash
+                                                   Output: a.id, a.properties
+                                                   ->  Seq Scan on order_by_opt."Person" a
+                                                         Output: a.id, a.properties
+                                       ->  Hash
+                                             Output: b.id, b.properties, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                             ->  Hash Join
+                                                   Output: b.id, b.properties, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.id
+                                                   Inner Unique: true
+                                                   Hash Cond: (_age_default_alias_1.start_id = b.id)
+                                                   ->  Seq Scan on order_by_opt.knows _age_default_alias_1
+                                                         Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                                                   ->  Hash
+                                                         Output: b.id, b.properties
+                                                         ->  Seq Scan on order_by_opt."Person" b
+                                                               Output: b.id, b.properties
+                                 ->  Hash
+                                       Output: c.id, c.properties
+                                       ->  Seq Scan on order_by_opt."Person" c
+                                             Output: c.id, c.properties
+(47 rows)
+
+--
+-- Test 20: WITH aggregation followed by ORDER BY on vertex
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, count(b) AS cnt
+    ORDER BY a
+    RETURN a.name, cnt
+$$) AS (a_name agtype, cnt agtype);
+ a_name | cnt 
+--------+-----
+ "A"    | 1
+ "B"    | 1
+ "C"    | 1
+ "D"    | 1
+ "E"    | 1
+ "F"    | 1
+ "G"    | 1
+(7 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, count(b) AS cnt
+    ORDER BY a
+    RETURN a.name, cnt
+$$) AS (a_name agtype, cnt agtype);
+                                                                                             QUERY PLAN                                                                                              
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), _age_default_alias_previous_cypher_clause.cnt
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), ((count(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::agtype), a.id
+         Sort Key: a.id
+         ->  HashAggregate
+               Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (count(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::agtype, a.id
+               Group Key: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)
+               ->  Hash Join
+                     Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), b.id, b.properties, a.id
+                     Inner Unique: true
+                     Hash Cond: (_age_default_alias_0.end_id = b.id)
+                     ->  Hash Join
+                           Output: a.id, a.properties, _age_default_alias_0.end_id
+                           Inner Unique: true
+                           Hash Cond: (_age_default_alias_0.start_id = a.id)
+                           ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                 Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                           ->  Hash
+                                 Output: a.id, a.properties
+                                 ->  Seq Scan on order_by_opt."Person" a
+                                       Output: a.id, a.properties
+                     ->  Hash
+                           Output: b.id, b.properties
+                           ->  Seq Scan on order_by_opt."Person" b
+                                 Output: b.id, b.properties
+(26 rows)
+
+--
+-- Test 21: Multiple MATCH with WITH and ORDER BY on multiple vertices
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    WITH a, b, c
+    ORDER BY a, b, c
+    RETURN a.name, b.name, c.name
+$$) AS (a_name agtype, b_name agtype, c_name agtype);
+ a_name | b_name | c_name 
+--------+--------+--------
+ "A"    | "B"    | "C"
+ "B"    | "C"    | "D"
+ "C"    | "D"    | "E"
+ "D"    | "E"    | "F"
+ "E"    | "F"    | "G"
+ "F"    | "G"    | "H"
+(6 rows)
+
+-- Verify optimization for three sort keys
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    MATCH (b)-[:knows]->(c:Person)
+    WITH a, b, c
+    ORDER BY a, b, c
+    RETURN a.name, b.name, c.name
+$$) AS (a_name agtype, b_name agtype, c_name agtype);
+                                                                                                                                                          QUERY PLAN                                                                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.c, '"name"'::agtype])
+   ->  Sort
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), (_agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties)), a.id, b.id, c.id
+         Sort Key: a.id, b.id, c.id
+         ->  Hash Join
+               Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), _agtype_build_vertex(c.id, _label_name('23460'::oid, c.id), c.properties), a.id, b.id, c.id
+               Inner Unique: true
+               Hash Cond: (_age_default_alias_1.end_id = c.id)
+               ->  Merge Join
+                     Output: a.id, a.properties, b.id, b.properties, _age_default_alias_1.end_id
+                     Merge Cond: (_age_default_alias_1.start_id = ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid))
+                     ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_1
+                           Output: _age_default_alias_1.id, _age_default_alias_1.start_id, _age_default_alias_1.end_id, _age_default_alias_1.properties
+                     ->  Sort
+                           Output: a.id, a.properties, b.id, b.properties, ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           Sort Key: ((age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)))::graphid)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, b.id, b.properties, age_id(_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties))
+                                 Inner Unique: true
+                                 Hash Cond: (_age_default_alias_0.end_id = b.id)
+                                 ->  Hash Join
+                                       Output: a.id, a.properties, _age_default_alias_0.end_id
+                                       Inner Unique: true
+                                       Hash Cond: (_age_default_alias_0.start_id = a.id)
+                                       ->  Seq Scan on order_by_opt.knows _age_default_alias_0
+                                             Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                                       ->  Hash
+                                             Output: a.id, a.properties
+                                             ->  Seq Scan on order_by_opt."Person" a
+                                                   Output: a.id, a.properties
+                                 ->  Hash
+                                       Output: b.id, b.properties
+                                       ->  Seq Scan on order_by_opt."Person" b
+                                             Output: b.id, b.properties
+               ->  Hash
+                     Output: c.id, c.properties
+                     ->  Seq Scan on order_by_opt."Person" c
+                           Output: c.id, c.properties
+(39 rows)
+
+--
+-- Test 22: WITH LIMIT and ORDER BY
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a, b
+    LIMIT 3
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+(3 rows)
+
+-- Verify optimization with LIMIT
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[:knows]->(b:Person)
+    WITH a, b
+    ORDER BY a, b
+    LIMIT 3
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Limit
+         Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id, b.id
+         ->  Incremental Sort
+               Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), a.id, b.id
+               Sort Key: a.id, b.id
+               Presorted Key: a.id
+               ->  Nested Loop
+                     Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), a.id, b.id
+                     Inner Unique: true
+                     ->  Merge Join
+                           Output: a.id, a.properties, _age_default_alias_0.end_id
+                           Merge Cond: (a.id = _age_default_alias_0.start_id)
+                           ->  Index Scan using "Person_pkey" on order_by_opt."Person" a
+                                 Output: a.id, a.properties
+                           ->  Index Scan using knows_start_id_idx on order_by_opt.knows _age_default_alias_0
+                                 Output: _age_default_alias_0.id, _age_default_alias_0.start_id, _age_default_alias_0.end_id, _age_default_alias_0.properties
+                     ->  Index Scan using "Person_pkey" on order_by_opt."Person" b
+                           Output: b.id, b.properties
+                           Index Cond: (b.id = _age_default_alias_0.end_id)
+(21 rows)
+
+--
+-- Test 23: Chained WITH with different ORDER BY columns at each level
+--
+SELECT * FROM cypher('order_by_opt', $$
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    WITH a, r, b
+    ORDER BY r
+    WITH a, r, b
+    ORDER BY a, b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+ a_name | b_name 
+--------+--------
+ "A"    | "B"
+ "B"    | "C"
+ "C"    | "D"
+ "D"    | "E"
+ "E"    | "F"
+ "F"    | "G"
+ "G"    | "H"
+(7 rows)
+
+-- Verify optimization
+SELECT * FROM cypher('order_by_opt', $$
+    EXPLAIN (VERBOSE, COSTS OFF)
+    MATCH (a:Person)-[r:knows]->(b:Person)
+    WITH a, r, b
+    ORDER BY r
+    WITH a, r, b
+    ORDER BY a, b
+    RETURN a.name, b.name
+$$) AS (a_name agtype, b_name agtype);
+                                                                                                                                         QUERY PLAN                                                                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Subquery Scan on _age_default_alias_previous_cypher_clause
+   Output: agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.a, '"name"'::agtype]), agtype_access_operator(VARIADIC ARRAY[_age_default_alias_previous_cypher_clause.b, '"name"'::agtype])
+   ->  Sort
+         Output: _age_default_alias_previous_cypher_clause_1.a, NULL::agtype, _age_default_alias_previous_cypher_clause_1.b
+         Sort Key: _age_default_alias_previous_cypher_clause_1.a, _age_default_alias_previous_cypher_clause_1.b
+         ->  Subquery Scan on _age_default_alias_previous_cypher_clause_1
+               Output: _age_default_alias_previous_cypher_clause_1.a, NULL::agtype, _age_default_alias_previous_cypher_clause_1.b
+               ->  Sort
+                     Output: (_agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties)), (_agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties)), (_agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties)), r.id
+                     Sort Key: r.id
+                     ->  Hash Join
+                           Output: _agtype_build_vertex(a.id, _label_name('23460'::oid, a.id), a.properties), _agtype_build_edge(r.id, r.start_id, r.end_id, _label_name('23460'::oid, r.id), r.properties), _agtype_build_vertex(b.id, _label_name('23460'::oid, b.id), b.properties), r.id
+                           Inner Unique: true
+                           Hash Cond: (r.end_id = b.id)
+                           ->  Hash Join
+                                 Output: a.id, a.properties, r.id, r.start_id, r.end_id, r.properties
+                                 Inner Unique: true
+                                 Hash Cond: (r.start_id = a.id)
+                                 ->  Seq Scan on order_by_opt.knows r
+                                       Output: r.id, r.start_id, r.end_id, r.properties
+                                 ->  Hash
+                                       Output: a.id, a.properties
+                                       ->  Seq Scan on order_by_opt."Person" a
+                                             Output: a.id, a.properties
+                           ->  Hash
+                                 Output: b.id, b.properties
+                                 ->  Seq Scan on order_by_opt."Person" b
+                                       Output: b.id, b.properties
+(28 rows)
+
+--
+-- Cleanup
+--
+SELECT drop_graph('order_by_opt', true);
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table order_by_opt._ag_label_vertex
+drop cascades to table order_by_opt._ag_label_edge
+drop cascades to table order_by_opt."Person"
+drop cascades to table order_by_opt.knows
+NOTICE:  graph "order_by_opt" has been dropped
+ drop_graph 
+------------
+ 
+(1 row)
+
