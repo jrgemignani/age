@@ -29,6 +29,7 @@
 #include "utils/builtins.h"
 
 #include "catalog/ag_graph.h"
+#include "optimizer/cypher_optimizer.h"
 #include "parser/cypher_analyze.h"
 #include "parser/cypher_clause.h"
 #include "parser/cypher_parser.h"
@@ -93,6 +94,13 @@ static void post_parse_analyze(ParseState *pstate, Query *query, JumbleState *js
     extra_node = NULL;
 
     convert_cypher_walker((Node *)query, pstate);
+
+    /*
+     * Post-transform optimization pass.
+     * At this point, cypher() transforms are complete and we can apply
+     * optimizations like ORDER BY on vertices/edges using the id field.
+     */
+    optimize_cypher_query(query);
 
     /*
      * If there is an extra_node returned, we need to check to see if

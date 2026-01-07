@@ -35,6 +35,7 @@ OBJS = src/backend/age.o \
        src/backend/nodes/cypher_outfuncs.o \
        src/backend/nodes/cypher_readfuncs.o \
        src/backend/optimizer/cypher_createplan.o \
+       src/backend/optimizer/cypher_optimizer.o \
        src/backend/optimizer/cypher_pathnode.o \
        src/backend/optimizer/cypher_paths.o \
        src/backend/parser/ag_scanner.o \
@@ -112,7 +113,8 @@ REGRESS = scan \
           name_validation \
           jsonb_operators \
           list_comprehension \
-          map_projection
+          map_projection \
+          cypher_order_by_optimize
 
 ifneq ($(EXTRA_TESTS),)
   REGRESS += $(EXTRA_TESTS)
