@@ -114,7 +114,8 @@ REGRESS = scan \
           jsonb_operators \
           list_comprehension \
           map_projection \
-          cypher_order_by_optimize
+          cypher_order_by_optimize \
+          agtype_scalar_optimize
 
 ifneq ($(EXTRA_TESTS),)
   REGRESS += $(EXTRA_TESTS)

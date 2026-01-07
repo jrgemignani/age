@@ -10507,6 +10507,59 @@ agtype *get_one_agtype_from_variadic_args(FunctionCallInfo fcinfo,
     Oid *types = NULL;
     agtype *agtype_result = NULL;
 
+    /*
+     * Fast path optimization: For non-variadic calls where the argument
+     * is already an agtype, we can avoid the overhead of extract_variadic_args
+     * which allocates three arrays. This is the common case for most agtype
+     * comparison and arithmetic operators.
+     */
+    if (!get_fn_expr_variadic(fcinfo->flinfo))
+    {
+        int total_args = PG_NARGS();
+        int actual_nargs = total_args - variadic_offset;
+
+        /* Verify expected number of arguments */
+        if (actual_nargs != expected_nargs)
+        {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("number of args %d does not match expected %d",
+                                   actual_nargs, expected_nargs)));
+        }
+
+        /* Check for SQL NULL */
+        if (PG_ARGISNULL(variadic_offset))
+        {
+            return NULL;
+        }
+
+        /* Check if the argument is already an agtype */
+        if (get_fn_expr_argtype(fcinfo->flinfo, variadic_offset) == AGTYPEOID)
+        {
+            agtype_container *agtc;
+
+            agtype_result = DATUM_GET_AGTYPE_P(PG_GETARG_DATUM(variadic_offset));
+            agtc = &agtype_result->root;
+
+            /*
+             * Is this a scalar (scalars are stored as one element arrays)?
+             * If so, test for agtype NULL.
+             */
+            if (AGTYPE_CONTAINER_IS_SCALAR(agtc) &&
+                AGTE_IS_NULL(agtc->children[0]))
+            {
+                return NULL;
+            }
+
+            return agtype_result;
+        }
+
+        /*
+         * Not an agtype, need to convert. Fall through to use
+         * extract_variadic_args for type conversion handling.
+         */
+    }
+
+    /* Standard path using extract_variadic_args */
     nargs = extract_variadic_args(fcinfo, variadic_offset, false, &args, &types,
                                   &nulls);
     /* throw an error if the number of args is not the expected number */
