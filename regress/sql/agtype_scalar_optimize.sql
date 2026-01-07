@@ -236,5 +236,69 @@ SELECT * FROM cypher('scalar_optimize_test', $$
     ORDER BY p.name
 $$) AS (name agtype, age agtype);
 
+--
+-- Test max()/min() on vertices (exercises direct id access optimization)
+-- These use compare_agtype_scalar_values for VERTEX type
+--
+
+-- Create edges between persons for edge testing
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+    CREATE (a)-[e:KNOWS {since: 2020}]->(b)
+    RETURN count(*)
+$$) AS (cnt agtype);
+
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
+    CREATE (b)-[e:KNOWS {since: 2021}]->(c)
+    RETURN count(*)
+$$) AS (cnt agtype);
+
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (c:Person {name: 'Charlie'}), (d:Person {name: 'David'})
+    CREATE (c)-[e:KNOWS {since: 2022}]->(d)
+    RETURN count(*)
+$$) AS (cnt agtype);
+
+-- Test max() on vertices - should return vertex with highest graphid
+-- We only check the name property to avoid ID differences in output
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (p:Person)
+    RETURN max(p).name
+$$) AS (max_name agtype);
+
+-- Test min() on vertices - should return vertex with lowest graphid
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (p:Person)
+    RETURN min(p).name
+$$) AS (min_name agtype);
+
+-- Test max() on edges - should return edge with highest graphid
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH ()-[e:KNOWS]->()
+    RETURN max(e).since
+$$) AS (max_since agtype);
+
+-- Test min() on edges - should return edge with lowest graphid
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH ()-[e:KNOWS]->()
+    RETURN min(e).since
+$$) AS (min_since agtype);
+
+-- Test ORDER BY on vertices directly (exercises the optimization path)
+-- Return only names to avoid ID differences
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (p:Person)
+    RETURN p.name
+    ORDER BY p
+$$) AS (name agtype);
+
+-- Test ORDER BY on vertices descending
+SELECT * FROM cypher('scalar_optimize_test', $$
+    MATCH (p:Person)
+    RETURN p.name
+    ORDER BY p DESC
+$$) AS (name agtype);
+
 -- Clean up
 SELECT * FROM drop_graph('scalar_optimize_test', true);

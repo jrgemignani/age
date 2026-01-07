@@ -1990,14 +1990,29 @@ int compare_agtype_scalar_values(agtype_value *a, agtype_value *b)
         case AGTV_VERTEX:
         case AGTV_EDGE:
         {
-            agtype_value *a_id, *b_id;
             graphid a_graphid, b_graphid;
 
-            a_id = GET_AGTYPE_VALUE_OBJECT_VALUE(a, "id");
-            b_id = GET_AGTYPE_VALUE_OBJECT_VALUE(b, "id");
+            /*
+             * Optimization: Access the "id" field directly at index 0.
+             *
+             * Vertex and edge objects are serialized with keys sorted by
+             * length first, then lexicographically (via uniqueify_agtype_object).
+             * Since "id" (2 chars) is always the shortest key in both vertex
+             * and edge objects, it is guaranteed to be at index 0:
+             *
+             * Vertex keys by length: "id"(2), "label"(5), "properties"(10)
+             * Edge keys by length: "id"(2), "label"(5), "end_id"(6),
+             *                      "start_id"(8), "properties"(10)
+             *
+             * This avoids the binary search overhead of GET_AGTYPE_VALUE_OBJECT_VALUE.
+             */
+            Assert(a->val.object.num_pairs > 0);
+            Assert(b->val.object.num_pairs > 0);
+            Assert(a->val.object.pairs[0].value.type == AGTV_INTEGER);
+            Assert(b->val.object.pairs[0].value.type == AGTV_INTEGER);
 
-            a_graphid = a_id->val.int_value;
-            b_graphid = b_id->val.int_value;
+            a_graphid = a->val.object.pairs[0].value.val.int_value;
+            b_graphid = b->val.object.pairs[0].value.val.int_value;
 
             if (a_graphid == b_graphid)
             {
