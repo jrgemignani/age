@@ -102,6 +102,8 @@ static int compare_two_floats_orderability(float8 lhs, float8 rhs);
 static int get_type_sort_priority(enum agtype_value_type type);
 static void pfree_iterator_agtype_value_token(agtype_iterator_token token,
                                               agtype_value *agtv);
+static bool find_matching_container_in_array(agtype_container *array_container,
+                                             agtype_value *target);
 
 /*
  * Turn an in-memory agtype_value into an agtype for on-disk storage.
@@ -1420,6 +1422,73 @@ static agtype_iterator *free_and_get_parent(agtype_iterator *it)
 }
 
 /*
+ * Helper function for agtype_deep_contains: check if any container element
+ * in the given array contains the target container.
+ *
+ * This uses a streaming approach instead of pre-loading all container elements,
+ * which provides O(N) complexity with early termination instead of O(N^2).
+ * Memory usage is O(1) instead of O(N).
+ */
+static bool find_matching_container_in_array(agtype_container *array_container,
+                                             agtype_value *target)
+{
+    agtentry *children;
+    char *base_addr;
+    uint32 count;
+    uint32 i;
+    uint32 offset;
+
+    /* Verify this is an array container */
+    if (!AGTYPE_CONTAINER_IS_ARRAY(array_container))
+        return false;
+
+    count = AGTYPE_CONTAINER_SIZE(array_container);
+    if (count == 0)
+        return false;
+
+    children = array_container->children;
+    base_addr = (char *)(children + count);
+    offset = 0;
+
+    /* Stream through array elements, checking each container */
+    for (i = 0; i < count; i++)
+    {
+        agtentry entry = children[i];
+
+        /* Only check container elements (nested arrays or objects) */
+        if (AGTE_IS_CONTAINER(entry))
+        {
+            agtype_container *elem_container;
+            agtype_iterator *lhs_iter;
+            agtype_iterator *rhs_iter;
+            bool contains;
+
+            /*
+             * Get the properly aligned container pointer.
+             * Container data is aligned to INTALIGN boundary within the
+             * base address offset.
+             */
+            elem_container = (agtype_container *)(base_addr + INTALIGN(offset));
+            lhs_iter = agtype_iterator_init(elem_container);
+            rhs_iter = agtype_iterator_init(target->val.binary.data);
+
+            contains = agtype_deep_contains(&lhs_iter, &rhs_iter, false);
+
+            pfree_if_not_null(lhs_iter);
+            pfree_if_not_null(rhs_iter);
+
+            /* Early termination on first match */
+            if (contains)
+                return true;
+        }
+
+        AGTE_ADVANCE_OFFSET(offset, entry);
+    }
+
+    return false;
+}
+
+/*
  * Worker for "contains" operator's function
  *
  * Formally speaking, containment is top-down, unordered subtree isomorphism.
@@ -1467,6 +1536,12 @@ bool agtype_deep_contains(agtype_iterator **val,
     {
         Assert(vval.type == AGTV_OBJECT);
         Assert(vcontained.type == AGTV_OBJECT);
+
+        /*
+         * Fast path: empty RHS object is always contained.
+         */
+        if (vcontained.val.object.num_pairs == 0)
+            return true;
 
         /*
          * If the lhs has fewer pairs than the rhs, it can't possibly contain
@@ -1578,9 +1653,6 @@ bool agtype_deep_contains(agtype_iterator **val,
     }
     else if (rcont == WAGT_BEGIN_ARRAY)
     {
-        agtype_value *lhs_conts = NULL;
-        uint32 num_lhs_elems = vval.val.array.num_elems;
-
         Assert(vval.type == AGTV_ARRAY);
         Assert(vcontained.type == AGTV_ARRAY);
 
@@ -1596,6 +1668,12 @@ bool agtype_deep_contains(agtype_iterator **val,
          */
         if (vval.val.array.raw_scalar && !vcontained.val.array.raw_scalar)
             return false;
+
+        /*
+         * Fast path: empty RHS array is always contained.
+         */
+        if (vcontained.val.array.num_elems == 0)
+            return true;
 
         /* Work through rhs "is it contained within?" array */
         for (;;)
@@ -1620,65 +1698,14 @@ bool agtype_deep_contains(agtype_iterator **val,
             }
             else
             {
-                uint32 i;
-
                 /*
-                 * If this is first container found in rhs array (at this
-                 * depth), initialize temp lhs array of containers
+                 * RHS element is a container (array or object). Use streaming
+                 * search through LHS array to find a matching container.
+                 * This avoids the O(N^2) complexity of pre-loading all LHS
+                 * container elements.
                  */
-                if (lhs_conts == NULL)
-                {
-                    uint32 j = 0;
-
-                    /* Make room for all possible values */
-                    lhs_conts = palloc(sizeof(agtype_value) * num_lhs_elems);
-
-                    for (i = 0; i < num_lhs_elems; i++)
-                    {
-                        /* Store all lhs elements in temp array */
-                        rcont = agtype_iterator_next(val, &vval, true);
-                        Assert(rcont == WAGT_ELEM);
-
-                        if (vval.type == AGTV_BINARY)
-                            lhs_conts[j++] = vval;
-                    }
-
-                    /* No container elements in temp array, so give up now */
-                    if (j == 0)
-                        return false;
-
-                    /* We may have only partially filled array */
-                    num_lhs_elems = j;
-                }
-
-                /* XXX: Nested array containment is O(N^2) */
-                for (i = 0; i < num_lhs_elems; i++)
-                {
-                    /* Nested container value (object or array) */
-                    agtype_iterator *nestval;
-                    agtype_iterator *nest_contained;
-                    bool contains;
-
-                    nestval =
-                        agtype_iterator_init(lhs_conts[i].val.binary.data);
-                    nest_contained =
-                        agtype_iterator_init(vcontained.val.binary.data);
-
-                    contains = agtype_deep_contains(&nestval, &nest_contained, false);
-
-                    if (nestval)
-                        pfree_if_not_null(nestval);
-                    if (nest_contained)
-                        pfree_if_not_null(nest_contained);
-                    if (contains)
-                        break;
-                }
-
-                /*
-                 * Report rhs container value is not contained if couldn't
-                 * match rhs container to *some* lhs cont
-                 */
-                if (i == num_lhs_elems)
+                if (!find_matching_container_in_array((*val)->container,
+                                                      &vcontained))
                     return false;
             }
         }

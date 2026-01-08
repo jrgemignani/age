@@ -300,5 +300,55 @@ SELECT * FROM cypher('scalar_optimize_test', $$
     ORDER BY p DESC
 $$) AS (name agtype);
 
+--
+-- Tests for agtype_deep_contains optimization
+-- These tests verify the streaming array containment algorithm
+-- which replaces the O(N^2) pre-loading approach.
+--
+
+-- Basic nested array containment
+SELECT '[[1,2], [3,4]]'::agtype @> '[[1,2]]'::agtype;
+SELECT '[[1,2], [3,4]]'::agtype @> '[[3,4]]'::agtype;
+SELECT '[[1,2], [3,4]]'::agtype @> '[[5,6]]'::agtype;
+
+-- Self-containment tests
+SELECT '["9", ["7", "3"], 1]'::agtype @> '["9", ["7", "3"], 1]'::agtype;
+SELECT '[[1,2], [3,4], [5,6]]'::agtype @> '[[1,2], [3,4], [5,6]]'::agtype;
+
+-- Empty array containment
+SELECT '[[1,2], [3,4]]'::agtype @> '[]'::agtype;
+SELECT '[1, 2, 3]'::agtype @> '[]'::agtype;
+SELECT '{"a": [1,2]}'::agtype @> '{}'::agtype;
+
+-- Nested object containment within arrays
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"a":1}]'::agtype;
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"b":2}]'::agtype;
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"c":3}]'::agtype;
+
+-- Deeply nested containment
+SELECT '[[[1,2]]]'::agtype @> '[[[1,2]]]'::agtype;
+SELECT '[[{"a":1}]]'::agtype @> '[[{"a":1}]]'::agtype;
+
+-- Mixed scalar and container containment
+SELECT '[1, [2,3], 4]'::agtype @> '[1]'::agtype;
+SELECT '[1, [2,3], 4]'::agtype @> '[[2,3]]'::agtype;
+SELECT '[1, [2,3], 4]'::agtype @> '[1, [2,3]]'::agtype;
+
+-- Early termination test (match in first position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[1,2]]'::agtype;
+
+-- Early termination test (match in middle position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[5,6]]'::agtype;
+
+-- Early termination test (match in last position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[7,8]]'::agtype;
+
+-- Non-containment (no match anywhere)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[9,10]]'::agtype;
+
+-- Contained-by operator tests (reverse containment)
+SELECT '[[1,2]]'::agtype <@ '[[1,2], [3,4]]'::agtype;
+SELECT '["9", ["7", "3"], ["1"]]'::agtype <@ '["9", ["7", "3"], ["1"]]'::agtype;
+
 -- Clean up
 SELECT * FROM drop_graph('scalar_optimize_test', true);

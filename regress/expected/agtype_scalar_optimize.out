@@ -741,6 +741,154 @@ $$) AS (name agtype);
  "Alice"
 (4 rows)
 
+--
+-- Tests for agtype_deep_contains optimization
+-- These tests verify the streaming array containment algorithm
+-- which replaces the O(N^2) pre-loading approach.
+--
+-- Basic nested array containment
+SELECT '[[1,2], [3,4]]'::agtype @> '[[1,2]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[[1,2], [3,4]]'::agtype @> '[[3,4]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[[1,2], [3,4]]'::agtype @> '[[5,6]]'::agtype;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- Self-containment tests
+SELECT '["9", ["7", "3"], 1]'::agtype @> '["9", ["7", "3"], 1]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[[1,2], [3,4], [5,6]]'::agtype @> '[[1,2], [3,4], [5,6]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Empty array containment
+SELECT '[[1,2], [3,4]]'::agtype @> '[]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[1, 2, 3]'::agtype @> '[]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '{"a": [1,2]}'::agtype @> '{}'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Nested object containment within arrays
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"a":1}]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"b":2}]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[{"a":1}, {"b":2}]'::agtype @> '[{"c":3}]'::agtype;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- Deeply nested containment
+SELECT '[[[1,2]]]'::agtype @> '[[[1,2]]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[[{"a":1}]]'::agtype @> '[[{"a":1}]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Mixed scalar and container containment
+SELECT '[1, [2,3], 4]'::agtype @> '[1]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[1, [2,3], 4]'::agtype @> '[[2,3]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '[1, [2,3], 4]'::agtype @> '[1, [2,3]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Early termination test (match in first position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[1,2]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Early termination test (match in middle position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[5,6]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Early termination test (match in last position)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[7,8]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Non-containment (no match anywhere)
+SELECT '[[1,2], [3,4], [5,6], [7,8]]'::agtype @> '[[9,10]]'::agtype;
+ ?column? 
+----------
+ f
+(1 row)
+
+-- Contained-by operator tests (reverse containment)
+SELECT '[[1,2]]'::agtype <@ '[[1,2], [3,4]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '["9", ["7", "3"], ["1"]]'::agtype <@ '["9", ["7", "3"], ["1"]]'::agtype;
+ ?column? 
+----------
+ t
+(1 row)
+
 -- Clean up
 SELECT * FROM drop_graph('scalar_optimize_test', true);
 NOTICE:  drop cascades to 4 other objects
